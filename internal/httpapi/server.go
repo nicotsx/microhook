@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/go-chi/chi/v5"
 )
 
 type Server struct {
@@ -15,13 +17,13 @@ type Server struct {
 }
 
 func New(listenAddress string, logger *slog.Logger) *Server {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthz)
+	router := chi.NewRouter()
+	router.HandleFunc("/healthz", healthz)
 
 	return &Server{
 		server: &http.Server{
 			Addr:              listenAddress,
-			Handler:           mux,
+			Handler:           router,
 			ReadHeaderTimeout: 5 * time.Second,
 			IdleTimeout:       60 * time.Second,
 		},
