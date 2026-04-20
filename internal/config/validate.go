@@ -81,11 +81,11 @@ func validateAction(errs *ValidationErrors, prefix string, action Action) {
 	}
 
 	switch action.ConcurrencyPolicy {
-	case "allow", "queue", "reject":
+	case "allow", "reject":
 	case "":
 		errs.Add(prefix + ".concurrency_policy is required")
 	default:
-		errs.Add(fmt.Sprintf("%s.concurrency_policy must be one of: allow, queue, reject", prefix))
+		errs.Add(fmt.Sprintf("%s.concurrency_policy must be one of: allow, reject", prefix))
 	}
 
 	if action.MaxOutputBytes < 0 {

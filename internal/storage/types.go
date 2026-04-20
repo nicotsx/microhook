@@ -7,7 +7,6 @@ import (
 )
 
 const (
-	RunStatusQueued    = "queued"
 	RunStatusRunning   = "running"
 	RunStatusSucceeded = "succeeded"
 	RunStatusFailed    = "failed"
@@ -16,11 +15,9 @@ const (
 )
 
 var (
-	ErrRunNotFound        = errors.New("run not found")
-	ErrQueuedRunNotFound  = errors.New("queued run not found")
-	ErrInvalidRetention   = errors.New("invalid retention policy")
-	ErrInvalidRunState    = errors.New("invalid run state")
-	ErrInvalidQueueRecord = errors.New("invalid queued run record")
+	ErrRunNotFound      = errors.New("run not found")
+	ErrInvalidRetention = errors.New("invalid retention policy")
+	ErrInvalidRunState  = errors.New("invalid run state")
 )
 
 type Run struct {
@@ -80,21 +77,6 @@ type UpdateRunParams struct {
 type RunFilter struct {
 	ActionName string
 	Status     string
-}
-
-type QueuedRun struct {
-	Sequence   int64
-	RunID      string
-	ActionName string
-	EnqueuedAt time.Time
-	Input      json.RawMessage
-}
-
-type EnqueueRunParams struct {
-	RunID      string
-	ActionName string
-	EnqueuedAt time.Time
-	Input      json.RawMessage
 }
 
 type RetentionPolicy struct {

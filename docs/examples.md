@@ -11,7 +11,7 @@ actions:
     command: ["docker", "compose", "down"]
     cwd: "/srv/mydb"
     timeout: "120s"
-    concurrency_policy: "queue"
+    concurrency_policy: "reject"
     max_output_bytes: 65536
     enabled: true
 
@@ -20,7 +20,7 @@ actions:
     command: ["docker", "compose", "up", "-d"]
     cwd: "/srv/mydb"
     timeout: "120s"
-    concurrency_policy: "queue"
+    concurrency_policy: "reject"
     max_output_bytes: 65536
     enabled: true
 ```

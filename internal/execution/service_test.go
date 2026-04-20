@@ -225,13 +225,13 @@ func TestServiceInvokeRejectsUnknownAndDisabledActions(t *testing.T) {
 	}
 }
 
-func TestServiceInvokeQueueSerializesRunsAndPersistsQueueState(t *testing.T) {
+func TestServiceInvokeRejectReturnsConflictWhileRunInFlight(t *testing.T) {
 	service, store := newTestService(t, []config.Action{{
 		Name:              "serial",
 		Mode:              config.ActionModeCommand,
 		Command:           []string{"/bin/sh", "-c", "sleep 0.1; printf \"$MICROHOOK_RUN_ID\""},
 		Timeout:           time.Second,
-		ConcurrencyPolicy: "queue",
+		ConcurrencyPolicy: "reject",
 		MaxOutputBytes:    64,
 		Enabled:           true,
 	}})
@@ -245,66 +245,28 @@ func TestServiceInvokeQueueSerializesRunsAndPersistsQueueState(t *testing.T) {
 
 	first, err := service.Invoke(context.Background(), InvokeParams{ActionName: "serial", Mode: InvokeModeAsync})
 	if err != nil {
-		t.Fatalf("invoke first queued action: %v", err)
+		t.Fatalf("invoke first reject action: %v", err)
 	}
 	if first.Status != storage.RunStatusRunning {
 		t.Fatalf("expected first run status %q, got %q", storage.RunStatusRunning, first.Status)
 	}
 
-	second, err := service.Invoke(context.Background(), InvokeParams{ActionName: "serial", Mode: InvokeModeAsync})
-	if err != nil {
-		t.Fatalf("invoke second queued action: %v", err)
-	}
-	if second.Status != storage.RunStatusQueued {
-		t.Fatalf("expected second run status %q, got %q", storage.RunStatusQueued, second.Status)
-	}
-	if second.StartedAt != nil {
-		t.Fatalf("expected queued run to omit started_at, got %v", second.StartedAt)
-	}
-
-	queuedRuns, err := store.ListQueuedRuns(context.Background(), "serial")
-	if err != nil {
-		t.Fatalf("list queued runs: %v", err)
-	}
-	if len(queuedRuns) != 1 {
-		t.Fatalf("expected 1 queued run, got %d", len(queuedRuns))
-	}
-	if queuedRuns[0].RunID != second.ID {
-		t.Fatalf("expected queued run id %q, got %q", second.ID, queuedRuns[0].RunID)
+	_, err = service.Invoke(context.Background(), InvokeParams{ActionName: "serial", Mode: InvokeModeAsync})
+	if !errors.Is(err, ErrActionConflict) {
+		t.Fatalf("expected action conflict, got %v", err)
 	}
 
 	first = waitForTerminalRun(t, store, first.ID)
-	second = waitForTerminalRun(t, store, second.ID)
 
 	if first.Status != storage.RunStatusSucceeded {
 		t.Fatalf("expected first run status %q, got %q", storage.RunStatusSucceeded, first.Status)
 	}
-	if second.Status != storage.RunStatusSucceeded {
-		t.Fatalf("expected second run status %q, got %q", storage.RunStatusSucceeded, second.Status)
-	}
-	if second.StartedAt == nil || first.FinishedAt == nil {
-		t.Fatal("expected queued runs to record started_at and finished_at")
-	}
-	if second.StartedAt.Before(*first.FinishedAt) {
-		t.Fatalf("expected second run to start after first finished, got %s before %s", second.StartedAt, first.FinishedAt)
-	}
 	if first.StdoutTail != "run-one" {
 		t.Fatalf("expected first stdout tail %q, got %q", "run-one", first.StdoutTail)
 	}
-	if second.StdoutTail != "run-two" {
-		t.Fatalf("expected second stdout tail %q, got %q", "run-two", second.StdoutTail)
-	}
-
-	queuedRuns, err = store.ListQueuedRuns(context.Background(), "serial")
-	if err != nil {
-		t.Fatalf("list queued runs after completion: %v", err)
-	}
-	if len(queuedRuns) != 0 {
-		t.Fatalf("expected queue to drain, got %+v", queuedRuns)
-	}
 }
 
-func TestServiceRecoverCancelsRunningRunsAndReplaysQueuedRunsFromSnapshot(t *testing.T) {
+func TestServiceRecoverCancelsInterruptedRunningRuns(t *testing.T) {
 	ctx := context.Background()
 	storagePath := filepath.Join(t.TempDir(), "microhook.db")
 	store, err := storage.Open(ctx, storagePath)
@@ -330,48 +292,13 @@ func TestServiceRecoverCancelsRunningRunsAndReplaysQueuedRunsFromSnapshot(t *tes
 			Mode:              config.ActionModeCommand,
 			Command:           []string{"/bin/sh", "-c", "printf should-not-run"},
 			Timeout:           time.Second,
-			ConcurrencyPolicy: "queue",
+			ConcurrencyPolicy: "reject",
 			MaxOutputBytes:    64,
 			Enabled:           true,
 		},
 	}); err != nil {
 		t.Fatalf("create running run: %v", err)
 	}
-
-	createQueuedRun := func(id, requestID, shellCommand string, createdAt time.Time) {
-		t.Helper()
-
-		if _, err := store.CreateRun(ctx, storage.CreateRunParams{
-			ID:              id,
-			ActionName:      "serial",
-			Status:          storage.RunStatusQueued,
-			CreatedAt:       createdAt,
-			RequestMetadata: json.RawMessage(`{"mode":"async","request_id":"` + requestID + `"}`),
-			ActionSnapshot: storage.ActionSnapshot{
-				Description:       "Recovered queued run",
-				Mode:              config.ActionModeCommand,
-				Command:           []string{"/bin/sh", "-c", shellCommand},
-				Timeout:           time.Second,
-				ConcurrencyPolicy: "queue",
-				MaxOutputBytes:    64,
-				Enabled:           true,
-			},
-		}); err != nil {
-			t.Fatalf("create queued run %q: %v", id, err)
-		}
-
-		if _, err := store.EnqueueRun(ctx, storage.EnqueueRunParams{
-			RunID:      id,
-			ActionName: "serial",
-			EnqueuedAt: createdAt,
-			Input:      json.RawMessage(`{"request_id":"` + requestID + `"}`),
-		}); err != nil {
-			t.Fatalf("enqueue queued run %q: %v", id, err)
-		}
-	}
-
-	createQueuedRun("run-queued-1", "recovered-1", `printf "$MICROHOOK_REQUEST_ID"; sleep 0.05`, startedAt.Add(time.Second))
-	createQueuedRun("run-queued-2", "recovered-2", `printf "$MICROHOOK_REQUEST_ID"`, startedAt.Add(2*time.Second))
 
 	service := New(store, mustRegistry(t, []config.Action{commandAction(
 		"serial",
@@ -392,36 +319,6 @@ func TestServiceRecoverCancelsRunningRunsAndReplaysQueuedRunsFromSnapshot(t *tes
 	}
 	if interrupted.ErrorSummary != restartedRunSummary {
 		t.Fatalf("expected interrupted run summary %q, got %q", restartedRunSummary, interrupted.ErrorSummary)
-	}
-
-	first := waitForTerminalRun(t, store, "run-queued-1")
-	second := waitForTerminalRun(t, store, "run-queued-2")
-
-	if first.Status != storage.RunStatusSucceeded {
-		t.Fatalf("expected first recovered run status %q, got %q", storage.RunStatusSucceeded, first.Status)
-	}
-	if second.Status != storage.RunStatusSucceeded {
-		t.Fatalf("expected second recovered run status %q, got %q", storage.RunStatusSucceeded, second.Status)
-	}
-	if first.StdoutTail != "recovered-1" {
-		t.Fatalf("expected first recovered stdout tail %q, got %q", "recovered-1", first.StdoutTail)
-	}
-	if second.StdoutTail != "recovered-2" {
-		t.Fatalf("expected second recovered stdout tail %q, got %q", "recovered-2", second.StdoutTail)
-	}
-	if first.FinishedAt == nil || second.StartedAt == nil {
-		t.Fatal("expected recovered runs to record finished_at and started_at")
-	}
-	if second.StartedAt.Before(*first.FinishedAt) {
-		t.Fatalf("expected second recovered run to start after first finished, got %s before %s", second.StartedAt, first.FinishedAt)
-	}
-
-	queuedRuns, err := store.ListQueuedRuns(ctx, "serial")
-	if err != nil {
-		t.Fatalf("list queued runs after recovery: %v", err)
-	}
-	if len(queuedRuns) != 0 {
-		t.Fatalf("expected recovered queue to drain, got %+v", queuedRuns)
 	}
 }
 
@@ -487,7 +384,7 @@ func waitForTerminalRun(t *testing.T, store *storage.Store, runID string) storag
 		if err != nil {
 			t.Fatalf("get run %q: %v", runID, err)
 		}
-		if run.Status != storage.RunStatusQueued && run.Status != storage.RunStatusRunning {
+		if run.Status != storage.RunStatusRunning {
 			return run
 		}
 

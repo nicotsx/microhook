@@ -13,8 +13,8 @@
 - Required endpoints: `TestServerHealthz`, `TestInvokeActionSyncReturnsCompletedRun`, `TestInvokeActionAsyncReturnsAcceptedRunAndSupportsLookup`, `TestListRunsSupportsActionAndStatusFilters`
 - Auth and action scoping: `TestProtectedRoutesRequireAuth`, `TestActionRoutesEnforceScopedAuthorization`, `TestAuthenticateMiddlewareStoresIdentityInRequestContext`
 - Timeout handling: `TestServiceInvokeMarksTimedOutRuns`
-- Concurrency behavior: `TestInvokeActionAsyncQueueReturnsQueuedRunIDBeforeWorkStarts`, `TestInvokeActionBadRequestConflictAndNotFound`, `TestServiceInvokeQueueSerializesRunsAndPersistsQueueState`
-- Restart durability: `TestServiceRecoverCancelsRunningRunsAndReplaysQueuedRunsFromSnapshot`, `TestBootstrapRecoversPersistedQueueStateOnStartup`
+- Concurrency behavior: `TestInvokeActionBadRequestConflictAndNotFound`, `TestServiceInvokeRejectReturnsConflictWhileRunInFlight`
+- Restart durability: `TestServiceRecoverCancelsInterruptedRunningRuns`, `TestBootstrapCancelsInterruptedRunsOnStartup`
 - Invalid config failure: `TestLoadRejectsInvalidConfig`, `TestLoadRejectsMalformedSections`, `TestValidateConfigRejectsInvalidConfig`
 - Logging and token redaction: `TestProtectedRoutesRequireAuth`, `TestServerLogsStructuredRequestEventsWithoutLeakingTokens`
 - Minimal child environment: `TestServiceInvokeCommandModePassesInputAndMetadata`

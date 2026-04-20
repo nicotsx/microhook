@@ -27,7 +27,7 @@ Check these first:
 
 The action uses `concurrency_policy: reject` and another run is already in flight.
 
-If you want later requests to wait instead of failing, switch the action to `queue`.
+If concurrent execution is safe for that action, switch it to `allow`. Otherwise, retry later from the caller.
 
 ## Action Timed Out
 

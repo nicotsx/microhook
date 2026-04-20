@@ -30,7 +30,7 @@ actions:
 
   - name: "shell-action"
     shell_command: "echo shell"
-    concurrency_policy: "queue"
+    concurrency_policy: "reject"
     max_output_bytes: 128
     enabled: false
 `)
@@ -95,8 +95,8 @@ actions:
 		t.Fatal("expected shell-action to report shell mode")
 	}
 
-	if shellAction.ConcurrencyPolicy != "queue" {
-		t.Fatalf("expected shell-action concurrency policy %q, got %q", "queue", shellAction.ConcurrencyPolicy)
+	if shellAction.ConcurrencyPolicy != "reject" {
+		t.Fatalf("expected shell-action concurrency policy %q, got %q", "reject", shellAction.ConcurrencyPolicy)
 	}
 
 	if shellAction.MaxOutputBytes != 128 {
@@ -184,7 +184,7 @@ actions:
 		"auth.tokens[0].actions[1] duplicates auth.tokens[0].actions[0] (\"missing-action\")",
 		"auth.tokens[0].actions[2] must not be empty",
 		"actions[0].timeout must be a valid duration:",
-		"actions[0].concurrency_policy must be one of: allow, queue, reject",
+		"actions[0].concurrency_policy must be one of: allow, reject",
 		"actions[0].max_output_bytes must be greater than or equal to 0",
 		"actions[0].env contains an empty key",
 		"actions[1].name duplicates actions[0].name (\"dup\")",

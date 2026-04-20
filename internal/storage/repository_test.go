@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestStorePersistsRunsAndQueueAcrossReopen(t *testing.T) {
+func TestStorePersistsRunsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	storagePath := filepath.Join(t.TempDir(), "microhook.db")
 
@@ -44,29 +44,6 @@ func TestStorePersistsRunsAndQueueAcrossReopen(t *testing.T) {
 		t.Fatalf("update run: %v", err)
 	}
 
-	queuedAt := createdAt.Add(10 * time.Second)
-	_, err = store.CreateRun(ctx, CreateRunParams{
-		ID:              "run-queued",
-		ActionName:      "backup",
-		Status:          RunStatusQueued,
-		CreatedAt:       queuedAt,
-		RequestMetadata: json.RawMessage(`{"request_id":"queue-1"}`),
-		ActionSnapshot:  testActionSnapshot(),
-	})
-	if err != nil {
-		t.Fatalf("create queued run: %v", err)
-	}
-
-	queuedRun, err := store.EnqueueRun(ctx, EnqueueRunParams{
-		RunID:      "run-queued",
-		ActionName: "backup",
-		EnqueuedAt: queuedAt,
-		Input:      json.RawMessage(`{"reason":"backup-start"}`),
-	})
-	if err != nil {
-		t.Fatalf("enqueue run: %v", err)
-	}
-
 	if err := store.Close(); err != nil {
 		t.Fatalf("close store before reopen: %v", err)
 	}
@@ -90,27 +67,6 @@ func TestStorePersistsRunsAndQueueAcrossReopen(t *testing.T) {
 		StdoutTail:      "deploy complete",
 		ActionSnapshot:  testActionSnapshot(),
 	})
-
-	persistedQueuedRun, err := store.GetQueuedRun(ctx, "run-queued")
-	if err != nil {
-		t.Fatalf("get persisted queued run: %v", err)
-	}
-
-	if persistedQueuedRun.Sequence != queuedRun.Sequence {
-		t.Fatalf("expected queue sequence %d, got %d", queuedRun.Sequence, persistedQueuedRun.Sequence)
-	}
-	if persistedQueuedRun.RunID != "run-queued" {
-		t.Fatalf("expected queued run id %q, got %q", "run-queued", persistedQueuedRun.RunID)
-	}
-	if persistedQueuedRun.ActionName != "backup" {
-		t.Fatalf("expected queued action %q, got %q", "backup", persistedQueuedRun.ActionName)
-	}
-	if !persistedQueuedRun.EnqueuedAt.Equal(queuedAt) {
-		t.Fatalf("expected queued at %s, got %s", queuedAt, persistedQueuedRun.EnqueuedAt)
-	}
-	if string(persistedQueuedRun.Input) != `{"reason":"backup-start"}` {
-		t.Fatalf("expected queued input to round-trip, got %q", string(persistedQueuedRun.Input))
-	}
 }
 
 func TestStoreListRunsSupportsFilters(t *testing.T) {
@@ -135,7 +91,7 @@ func TestStoreListRunsSupportsFilters(t *testing.T) {
 		{
 			ID:             "run-3",
 			ActionName:     "backup",
-			Status:         RunStatusQueued,
+			Status:         RunStatusRunning,
 			CreatedAt:      time.Date(2026, time.April, 21, 10, 17, 0, 0, time.UTC),
 			ActionSnapshot: testActionSnapshot(),
 		},
@@ -159,15 +115,15 @@ func TestStoreListRunsSupportsFilters(t *testing.T) {
 		t.Fatal("expected list runs to include action snapshot data")
 	}
 
-	queuedRuns, err := store.ListRuns(ctx, RunFilter{Status: RunStatusQueued})
+	runningRuns, err := store.ListRuns(ctx, RunFilter{Status: RunStatusRunning})
 	if err != nil {
 		t.Fatalf("list runs by status: %v", err)
 	}
-	if len(queuedRuns) != 1 {
-		t.Fatalf("expected 1 queued run, got %d", len(queuedRuns))
+	if len(runningRuns) != 1 {
+		t.Fatalf("expected 1 running run, got %d", len(runningRuns))
 	}
-	if queuedRuns[0].ID != "run-3" {
-		t.Fatalf("expected queued run id %q, got %q", "run-3", queuedRuns[0].ID)
+	if runningRuns[0].ID != "run-3" {
+		t.Fatalf("expected running run id %q, got %q", "run-3", runningRuns[0].ID)
 	}
 }
 
@@ -205,26 +161,10 @@ func TestStoreApplyRetentionPrunesTerminalRunsByAgeAndCount(t *testing.T) {
 			CreatedAt:      now.Add(-90 * time.Minute),
 			ActionSnapshot: testActionSnapshot(),
 		},
-		{
-			ID:             "still-queued",
-			ActionName:     "backup",
-			Status:         RunStatusQueued,
-			CreatedAt:      now.Add(-30 * time.Minute),
-			ActionSnapshot: testActionSnapshot(),
-		},
 	} {
 		if _, err := store.CreateRun(ctx, run); err != nil {
 			t.Fatalf("create run %q: %v", run.ID, err)
 		}
-	}
-
-	if _, err := store.EnqueueRun(ctx, EnqueueRunParams{
-		RunID:      "still-queued",
-		ActionName: "backup",
-		EnqueuedAt: now.Add(-30 * time.Minute),
-		Input:      json.RawMessage(`{"reason":"backup-start"}`),
-	}); err != nil {
-		t.Fatalf("enqueue queued run: %v", err)
 	}
 
 	result, err := store.ApplyRetention(ctx, RetentionPolicy{MaxAge: 48 * time.Hour, MaxRuns: 1})
@@ -245,18 +185,10 @@ func TestStoreApplyRetentionPrunesTerminalRunsByAgeAndCount(t *testing.T) {
 		}
 	}
 
-	for _, keptID := range []string{"recent-failed", "still-running", "still-queued"} {
+	for _, keptID := range []string{"recent-failed", "still-running"} {
 		if _, err := store.GetRun(ctx, keptID); err != nil {
 			t.Fatalf("expected %q to remain after retention, got %v", keptID, err)
 		}
-	}
-
-	queuedRuns, err := store.ListQueuedRuns(ctx, "backup")
-	if err != nil {
-		t.Fatalf("list queued runs after retention: %v", err)
-	}
-	if len(queuedRuns) != 1 || queuedRuns[0].RunID != "still-queued" {
-		t.Fatalf("expected queued run to survive retention, got %+v", queuedRuns)
 	}
 
 	prunedAt, err := store.LastRetentionPruneAt(ctx)
@@ -268,7 +200,7 @@ func TestStoreApplyRetentionPrunesTerminalRunsByAgeAndCount(t *testing.T) {
 	}
 }
 
-func TestOpenMigratesVersionOneSchema(t *testing.T) {
+func TestOpenBootstrapsMissingTablesInExistingDatabase(t *testing.T) {
 	ctx := context.Background()
 	storagePath := filepath.Join(t.TempDir(), "microhook.db")
 	db, err := sql.Open("sqlite", sqliteDSN(storagePath))
@@ -281,10 +213,7 @@ CREATE TABLE microhook_metadata (
 	value TEXT NOT NULL
 )
 `); err != nil {
-		t.Fatalf("create legacy metadata table: %v", err)
-	}
-	if _, err := db.ExecContext(ctx, `PRAGMA user_version = 1`); err != nil {
-		t.Fatalf("set legacy schema version: %v", err)
+		t.Fatalf("create existing metadata table: %v", err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("close raw sqlite db: %v", err)
@@ -292,13 +221,13 @@ CREATE TABLE microhook_metadata (
 
 	store := openStore(t, storagePath)
 	if _, err := store.CreateRun(ctx, CreateRunParams{
-		ID:             "run-after-migrate",
+		ID:             "run-after-bootstrap",
 		ActionName:     "deploy",
-		Status:         RunStatusQueued,
+		Status:         RunStatusRunning,
 		CreatedAt:      time.Date(2026, time.April, 21, 10, 0, 0, 0, time.UTC),
 		ActionSnapshot: testActionSnapshot(),
 	}); err != nil {
-		t.Fatalf("create run after migration: %v", err)
+		t.Fatalf("create run after bootstrap: %v", err)
 	}
 }
 
@@ -326,7 +255,7 @@ func testActionSnapshot() ActionSnapshot {
 		Cwd:               "/srv/app",
 		Timeout:           2 * time.Minute,
 		Env:               map[string]string{"ENVIRONMENT": "production"},
-		ConcurrencyPolicy: "queue",
+		ConcurrencyPolicy: "allow",
 		MaxOutputBytes:    4096,
 		Enabled:           true,
 	}

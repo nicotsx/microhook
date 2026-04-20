@@ -71,7 +71,7 @@ Retention pruning runs on startup.
 | `cwd` | no | `""` | Working directory for the child process |
 | `timeout` | no | no timeout | Go duration string such as `30s` or `2m` |
 | `env` | no | empty | Fixed environment variables added to the child process |
-| `concurrency_policy` | no | `allow` | `allow`, `queue`, or `reject` |
+| `concurrency_policy` | no | `allow` | `allow` or `reject` |
 | `max_output_bytes` | no | `65536` | Captured tail size for stdout and stderr |
 | `enabled` | no | `true` | Disabled actions remain in config but cannot be invoked |
 

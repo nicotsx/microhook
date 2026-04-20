@@ -57,7 +57,7 @@ Async response example:
 {
   "id": "run_0123456789abcdef0123456789abcdef",
   "action": "hello",
-  "status": "queued",
+  "status": "running",
   "created_at": "2026-04-21T10:15:00Z",
   "request_metadata": {
     "mode": "async",
@@ -77,7 +77,7 @@ List runs.
 Supported query parameters:
 
 - `action=<name>`
-- `status=<queued|running|succeeded|failed|timed_out|cancelled>`
+- `status=<running|succeeded|failed|timed_out|cancelled>`
 
 ### `GET /healthz`
 
@@ -85,7 +85,6 @@ Returns `200 OK` with a plain-text body of `ok`.
 
 ## Run Statuses
 
-- `queued`
 - `running`
 - `succeeded`
 - `failed`

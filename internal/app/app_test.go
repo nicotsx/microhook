@@ -142,7 +142,7 @@ func TestBootstrapAppliesConfiguredRetentionOnStartup(t *testing.T) {
 			Cwd:               "/tmp",
 			Timeout:           time.Minute,
 			Env:               map[string]string{"ENVIRONMENT": "test"},
-			ConcurrencyPolicy: "queue",
+			ConcurrencyPolicy: "allow",
 			MaxOutputBytes:    1024,
 			Enabled:           true,
 		},
@@ -196,7 +196,7 @@ func TestBootstrapAppliesConfiguredRetentionOnStartup(t *testing.T) {
 	}
 }
 
-func TestBootstrapRecoversPersistedQueueStateOnStartup(t *testing.T) {
+func TestBootstrapCancelsInterruptedRunsOnStartup(t *testing.T) {
 	ctx := context.Background()
 	storagePath := filepath.Join(t.TempDir(), "microhook.db")
 	store, err := storage.Open(ctx, storagePath)
@@ -217,40 +217,12 @@ func TestBootstrapRecoversPersistedQueueStateOnStartup(t *testing.T) {
 			Mode:              config.ActionModeCommand,
 			Command:           []string{"/bin/sh", "-c", "printf should-not-run"},
 			Timeout:           time.Second,
-			ConcurrencyPolicy: "queue",
+			ConcurrencyPolicy: "reject",
 			MaxOutputBytes:    64,
 			Enabled:           true,
 		},
 	}); err != nil {
 		t.Fatalf("create interrupted run: %v", err)
-	}
-
-	queuedAt := startedAt.Add(time.Second)
-	if _, err := store.CreateRun(ctx, storage.CreateRunParams{
-		ID:              "run-queued",
-		ActionName:      "serial",
-		Status:          storage.RunStatusQueued,
-		CreatedAt:       queuedAt,
-		RequestMetadata: json.RawMessage(`{"mode":"async","request_id":"boot-recovered"}`),
-		ActionSnapshot: storage.ActionSnapshot{
-			Description:       "Recovered queued run",
-			Mode:              config.ActionModeCommand,
-			Command:           []string{"/bin/sh", "-c", `printf "$MICROHOOK_REQUEST_ID"`},
-			Timeout:           time.Second,
-			ConcurrencyPolicy: "queue",
-			MaxOutputBytes:    64,
-			Enabled:           true,
-		},
-	}); err != nil {
-		t.Fatalf("create queued run: %v", err)
-	}
-	if _, err := store.EnqueueRun(ctx, storage.EnqueueRunParams{
-		RunID:      "run-queued",
-		ActionName: "serial",
-		EnqueuedAt: queuedAt,
-		Input:      json.RawMessage(`{"request_id":"boot-recovered"}`),
-	}); err != nil {
-		t.Fatalf("enqueue queued run: %v", err)
 	}
 
 	if err := store.Close(); err != nil {
@@ -270,7 +242,7 @@ func TestBootstrapRecoversPersistedQueueStateOnStartup(t *testing.T) {
 			Mode:              config.ActionModeCommand,
 			Command:           []string{"/bin/sh", "-c", "printf registry-definition"},
 			Timeout:           time.Second,
-			ConcurrencyPolicy: "queue",
+			ConcurrencyPolicy: "reject",
 			MaxOutputBytes:    64,
 			Enabled:           true,
 		}},
@@ -296,25 +268,6 @@ func TestBootstrapRecoversPersistedQueueStateOnStartup(t *testing.T) {
 		}
 		if run.ErrorSummary != "service restarted before run completion" {
 			return errors.New("interrupted run summary not recovered yet")
-		}
-
-		queuedRun, err := application.storage.GetRun(ctx, "run-queued")
-		if err != nil {
-			return err
-		}
-		if queuedRun.Status != storage.RunStatusSucceeded {
-			return errors.New("queued run not finished yet")
-		}
-		if queuedRun.StdoutTail != "boot-recovered" {
-			return errors.New("queued run did not execute recovered snapshot")
-		}
-
-		queuedRuns, err := application.storage.ListQueuedRuns(ctx, "serial")
-		if err != nil {
-			return err
-		}
-		if len(queuedRuns) != 0 {
-			return errors.New("queued metadata still present after recovery")
 		}
 
 		return nil

@@ -32,9 +32,6 @@ type runStore interface {
 	UpdateRun(context.Context, storage.UpdateRunParams) error
 	GetRun(context.Context, string) (storage.Run, error)
 	ListRuns(context.Context, storage.RunFilter) ([]storage.Run, error)
-	EnqueueRun(context.Context, storage.EnqueueRunParams) (storage.QueuedRun, error)
-	ListQueuedRuns(context.Context, string) ([]storage.QueuedRun, error)
-	DeleteQueuedRun(context.Context, string) error
 }
 
 type Service struct {
@@ -43,8 +40,8 @@ type Service struct {
 	now      func() time.Time
 	newRunID func() (string, error)
 
-	mu      sync.Mutex
-	actions map[string]*actionState
+	mu            sync.Mutex
+	rejectRunning map[string]bool
 }
 
 type InvokeParams struct {
@@ -55,26 +52,6 @@ type InvokeParams struct {
 	RequestID       string
 }
 
-type actionState struct {
-	running   int
-	preparing int
-	queue     []queuedInvocation
-}
-
-type queuedInvocation struct {
-	action    config.Action
-	run       storage.Run
-	input     json.RawMessage
-	requestID string
-	runCtx    context.Context
-	waitCh    chan invokeResult
-}
-
-type invokeResult struct {
-	run storage.Run
-	err error
-}
-
 func New(store runStore, registry config.ActionRegistry) *Service {
 	return &Service{
 		store:    store,
@@ -82,8 +59,8 @@ func New(store runStore, registry config.ActionRegistry) *Service {
 		now: func() time.Time {
 			return time.Now().UTC()
 		},
-		newRunID: generateRunID,
-		actions:  make(map[string]*actionState),
+		newRunID:      generateRunID,
+		rejectRunning: make(map[string]bool),
 	}
 }
 
@@ -92,29 +69,7 @@ func (s *Service) Recover(ctx context.Context) error {
 		return fmt.Errorf("recover execution state: execution store is required")
 	}
 
-	if err := s.cancelInterruptedRuns(ctx); err != nil {
-		return err
-	}
-
-	queuedRuns, err := s.store.ListQueuedRuns(ctx, "")
-	if err != nil {
-		return fmt.Errorf("recover execution state: list queued runs: %w", err)
-	}
-
-	if err := s.cancelQueuedRunsMissingMetadata(ctx, queuedRuns); err != nil {
-		return err
-	}
-
-	actionNames, err := s.rebuildQueueState(ctx, queuedRuns)
-	if err != nil {
-		return err
-	}
-
-	for _, actionName := range actionNames {
-		s.finishQueueAction(actionName)
-	}
-
-	return nil
+	return s.cancelInterruptedRuns(ctx)
 }
 
 func (s *Service) Invoke(ctx context.Context, params InvokeParams) (storage.Run, error) {
@@ -155,8 +110,6 @@ func (s *Service) Invoke(ctx context.Context, params InvokeParams) (storage.Run,
 		return s.invokeAllow(ctx, action, mode, input, requestMetadata, params.RequestID)
 	case "reject":
 		return s.invokeReject(ctx, action, mode, input, requestMetadata, params.RequestID)
-	case "queue":
-		return s.invokeQueue(ctx, action, mode, input, requestMetadata, params.RequestID)
 	default:
 		return storage.Run{}, fmt.Errorf("invoke action %q: unsupported concurrency policy %q", actionName, action.ConcurrencyPolicy)
 	}
@@ -190,24 +143,6 @@ func (s *Service) createRun(ctx context.Context, action config.Action, status st
 	})
 	if err != nil {
 		return storage.Run{}, fmt.Errorf("invoke action %q: create run: %w", action.Name, err)
-	}
-
-	return run, nil
-}
-
-func (s *Service) markRunRunning(ctx context.Context, runID string) (storage.Run, error) {
-	startedAt := s.now()
-	if err := s.store.UpdateRun(ctx, storage.UpdateRunParams{
-		ID:        runID,
-		Status:    storage.RunStatusRunning,
-		StartedAt: &startedAt,
-	}); err != nil {
-		return storage.Run{}, fmt.Errorf("mark run %q running: %w", runID, err)
-	}
-
-	run, err := s.store.GetRun(ctx, runID)
-	if err != nil {
-		return storage.Run{}, fmt.Errorf("get run %q after start: %w", runID, err)
 	}
 
 	return run, nil
@@ -290,13 +225,4 @@ func normalizeInvokeMode(mode string) (string, error) {
 	default:
 		return "", ErrInvalidMode
 	}
-}
-
-func deliverInvokeResult(waitCh chan invokeResult, run storage.Run, err error) {
-	if waitCh == nil {
-		return
-	}
-
-	waitCh <- invokeResult{run: run, err: err}
-	close(waitCh)
 }

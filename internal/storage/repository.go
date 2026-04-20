@@ -283,121 +283,6 @@ func (s *Store) ListRuns(ctx context.Context, filter RunFilter) ([]Run, error) {
 	return runs, nil
 }
 
-func (s *Store) EnqueueRun(ctx context.Context, params EnqueueRunParams) (QueuedRun, error) {
-	if strings.TrimSpace(params.RunID) == "" {
-		return QueuedRun{}, fmt.Errorf("enqueue run: %w: run id is required", ErrInvalidQueueRecord)
-	}
-	if strings.TrimSpace(params.ActionName) == "" {
-		return QueuedRun{}, fmt.Errorf("enqueue run %q: %w: action name is required", params.RunID, ErrInvalidQueueRecord)
-	}
-
-	enqueuedAt := params.EnqueuedAt
-	if enqueuedAt.IsZero() {
-		enqueuedAt = time.Now().UTC()
-	}
-	enqueuedAt, err := normalizeTime(enqueuedAt)
-	if err != nil {
-		return QueuedRun{}, fmt.Errorf("enqueue run %q: %w", params.RunID, err)
-	}
-
-	inputJSON, err := normalizeRawJSON(params.Input)
-	if err != nil {
-		return QueuedRun{}, fmt.Errorf("enqueue run %q: input payload: %w", params.RunID, err)
-	}
-
-	_, err = s.db.ExecContext(ctx, `
-INSERT INTO microhook_queued_runs (
-	run_id,
-	action_name,
-	enqueued_at_unix_nano,
-	input_json
-) VALUES (?, ?, ?, ?)
-`, params.RunID, params.ActionName, enqueuedAt.UnixNano(), inputJSON)
-	if err != nil {
-		return QueuedRun{}, fmt.Errorf("enqueue run %q: %w", params.RunID, err)
-	}
-
-	return s.GetQueuedRun(ctx, params.RunID)
-}
-
-func (s *Store) GetQueuedRun(ctx context.Context, runID string) (QueuedRun, error) {
-	if strings.TrimSpace(runID) == "" {
-		return QueuedRun{}, fmt.Errorf("get queued run: %w: run id is required", ErrInvalidQueueRecord)
-	}
-
-	row := s.db.QueryRowContext(ctx, `
-SELECT queue_sequence, run_id, action_name, enqueued_at_unix_nano, input_json
-FROM microhook_queued_runs
-WHERE run_id = ?
-`, runID)
-
-	queuedRun, err := scanQueuedRun(row)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return QueuedRun{}, fmt.Errorf("get queued run %q: %w", runID, ErrQueuedRunNotFound)
-		}
-		return QueuedRun{}, fmt.Errorf("get queued run %q: %w", runID, err)
-	}
-
-	return queuedRun, nil
-}
-
-func (s *Store) ListQueuedRuns(ctx context.Context, actionName string) ([]QueuedRun, error) {
-	args := make([]any, 0, 1)
-	query := `
-SELECT queue_sequence, run_id, action_name, enqueued_at_unix_nano, input_json
-FROM microhook_queued_runs`
-
-	if actionName = strings.TrimSpace(actionName); actionName != "" {
-		query += "\nWHERE action_name = ?"
-		args = append(args, actionName)
-	}
-
-	query += "\nORDER BY action_name ASC, queue_sequence ASC"
-
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list queued runs: %w", err)
-	}
-	defer rows.Close()
-
-	queuedRuns := make([]QueuedRun, 0)
-	for rows.Next() {
-		queuedRun, err := scanQueuedRun(rows)
-		if err != nil {
-			return nil, fmt.Errorf("list queued runs: %w", err)
-		}
-		queuedRuns = append(queuedRuns, queuedRun)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list queued runs: %w", err)
-	}
-
-	return queuedRuns, nil
-}
-
-func (s *Store) DeleteQueuedRun(ctx context.Context, runID string) error {
-	if strings.TrimSpace(runID) == "" {
-		return fmt.Errorf("delete queued run: %w: run id is required", ErrInvalidQueueRecord)
-	}
-
-	result, err := s.db.ExecContext(ctx, `DELETE FROM microhook_queued_runs WHERE run_id = ?`, runID)
-	if err != nil {
-		return fmt.Errorf("delete queued run %q: %w", runID, err)
-	}
-
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("delete queued run %q: read affected rows: %w", runID, err)
-	}
-	if affected == 0 {
-		return fmt.Errorf("delete queued run %q: %w", runID, ErrQueuedRunNotFound)
-	}
-
-	return nil
-}
-
 func (s *Store) ApplyRetention(ctx context.Context, policy RetentionPolicy) (RetentionResult, error) {
 	if policy.MaxAge < 0 || policy.MaxRuns < 0 {
 		return RetentionResult{}, fmt.Errorf("apply retention: %w", ErrInvalidRetention)
@@ -421,10 +306,10 @@ DELETE FROM microhook_runs
 WHERE id IN (
 	SELECT id
 	FROM microhook_runs
-	WHERE status NOT IN (?, ?)
+	WHERE status <> ?
 	AND created_at_unix_nano < ?
 )
-`, RunStatusQueued, RunStatusRunning, prunedAt.Add(-policy.MaxAge).UnixNano())
+`, RunStatusRunning, prunedAt.Add(-policy.MaxAge).UnixNano())
 		if err != nil {
 			return RetentionResult{}, fmt.Errorf("apply retention: prune by age: %w", err)
 		}
@@ -442,11 +327,11 @@ DELETE FROM microhook_runs
 WHERE id IN (
 	SELECT id
 	FROM microhook_runs
-	WHERE status NOT IN (?, ?)
+	WHERE status <> ?
 	ORDER BY created_at_unix_nano DESC, id DESC
 	LIMIT -1 OFFSET ?
 )
-`, RunStatusQueued, RunStatusRunning, policy.MaxRuns)
+`, RunStatusRunning, policy.MaxRuns)
 		if err != nil {
 			return RetentionResult{}, fmt.Errorf("apply retention: prune by max runs: %w", err)
 		}
@@ -564,32 +449,9 @@ func scanRun(scanner rowScanner) (Run, error) {
 	return run, nil
 }
 
-func scanQueuedRun(scanner rowScanner) (QueuedRun, error) {
-	var (
-		queuedRun          QueuedRun
-		enqueuedAtUnixNano int64
-		inputJSON          []byte
-	)
-
-	err := scanner.Scan(
-		&queuedRun.Sequence,
-		&queuedRun.RunID,
-		&queuedRun.ActionName,
-		&enqueuedAtUnixNano,
-		&inputJSON,
-	)
-	if err != nil {
-		return QueuedRun{}, err
-	}
-
-	queuedRun.EnqueuedAt = time.Unix(0, enqueuedAtUnixNano).UTC()
-	queuedRun.Input = cloneBytes(inputJSON)
-	return queuedRun, nil
-}
-
 func validateRunStatus(status string) error {
 	switch strings.TrimSpace(status) {
-	case RunStatusQueued, RunStatusRunning, RunStatusSucceeded, RunStatusFailed, RunStatusTimedOut, RunStatusCancelled:
+	case RunStatusRunning, RunStatusSucceeded, RunStatusFailed, RunStatusTimedOut, RunStatusCancelled:
 		return nil
 	default:
 		return fmt.Errorf("%w: unsupported run status %q", ErrInvalidRunState, status)
