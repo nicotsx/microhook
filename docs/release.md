@@ -36,6 +36,7 @@ VERSION=v1.0.0 make release-check
 - `go test ./...`
 - release artifact packaging
 - Linux install smoke validation when running on Linux
+- packaged-binary release e2e validation when running on Linux
 - `systemd` unit verification when `systemd-analyze` is available
 
 The GitHub Actions workflow at `.github/workflows/release-readiness.yml` runs the same release-readiness path on a clean Ubuntu runner and also verifies the Docker build.
@@ -64,6 +65,7 @@ After building a release tarball, verify installation on a clean Linux host:
 
 ```bash
 ./scripts/install-smoke.sh dist/microhook_v1.0.0_linux_amd64.tar.gz
+./scripts/release-e2e.sh dist/microhook_v1.0.0_linux_amd64.tar.gz
 ./scripts/verify-systemd.sh
 ```
 
@@ -76,6 +78,15 @@ The smoke test validates:
 - authenticated invocation
 - run lookup
 - invalid-config failure behavior
+
+The packaged-binary release e2e validates:
+
+- bearer-token auth boundaries (`401`, `403`)
+- sync and async action execution through the real HTTP API
+- `400`, `404`, and `409` API behavior
+- timeout handling
+- restart recovery for interrupted runs
+- persisted lookup and filtered listing after restart
 
 ## Publish Checklist
 

@@ -4,6 +4,8 @@ Microhook is a lightweight, self-hosted action runner that exposes an authentica
 
 It is built for operators who want a small, auditable alternative to "remote shell over HTTP".
 
+Disclaimer: This is an experiment, do not run this in production without a thorough security review and understanding of the code and its limitations. See `docs/security.md` for more details.
+
 ## What It Is
 
 - A single Go binary.
@@ -73,10 +75,11 @@ curl \
 - `systemd` unit: `packaging/systemd/microhook.service`
 - Release artifact builder: `scripts/build-release.sh`
 - Linux install smoke test: `scripts/install-smoke.sh`
+- Packaged-binary Linux e2e: `scripts/release-e2e.sh`
 - `systemd` verifier: `scripts/verify-systemd.sh`
 
 ## Release Commands
 
 - `make release-artifacts` builds static Linux tarballs for `amd64` and `arm64`.
 - `make docker-build` builds the convenience container image.
-- `make release-check` runs tests, packages release artifacts, runs the Linux install smoke test when possible, and verifies the `systemd` unit when possible.
+- `make release-check` runs tests, packages release artifacts, runs the Linux install smoke and packaged-binary e2e checks when possible, and verifies the `systemd` unit when possible.

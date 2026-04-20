@@ -21,7 +21,7 @@ LDFLAGS += -X $(BUILDINFO_PACKAGE).Commit=$(COMMIT)
 LDFLAGS += -X $(BUILDINFO_PACKAGE).BuildTime=$(BUILD_TIME)
 LDFLAGS += -X $(BUILDINFO_PACKAGE).BuiltBy=$(BUILT_BY)
 
-.PHONY: help deps tidy fmt test build run validate-config version generate-token release-artifacts docker-build install-smoke verify-systemd release-check install clean
+.PHONY: help deps tidy fmt test build run validate-config version generate-token release-artifacts docker-build install-smoke release-e2e verify-systemd release-check install clean
 
 help:
 	@printf "Targets:\n"
@@ -33,6 +33,7 @@ help:
 	@printf "  make release-artifacts  Build Linux release tarballs\n"
 	@printf "  make docker-build       Build the Docker image\n"
 	@printf "  make install-smoke      Run the Linux install smoke test\n"
+	@printf "  make release-e2e        Run the packaged-binary Linux release e2e\n"
 	@printf "  make verify-systemd     Verify the packaged systemd unit\n"
 	@printf "  make release-check      Run tests and release-readiness checks\n"
 	@printf "  make run CONFIG=...     Run the service with a config file\n"
@@ -79,6 +80,9 @@ generate-token:
 install-smoke:
 	./scripts/install-smoke.sh "$(RELEASE_DIR)/$(BINARY)_$(VERSION)_linux_amd64.tar.gz"
 
+release-e2e:
+	./scripts/release-e2e.sh "$(RELEASE_DIR)/$(BINARY)_$(VERSION)_linux_amd64.tar.gz"
+
 verify-systemd:
 	./scripts/verify-systemd.sh
 
@@ -86,6 +90,7 @@ release-check:
 	$(MAKE) test
 	$(MAKE) release-artifacts VERSION="$(VERSION)"
 	$(MAKE) install-smoke VERSION="$(VERSION)"
+	$(MAKE) release-e2e VERSION="$(VERSION)"
 	$(MAKE) verify-systemd
 
 install:

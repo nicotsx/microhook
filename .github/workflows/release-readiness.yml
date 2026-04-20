@@ -29,6 +29,9 @@ jobs:
       - name: Run Linux install smoke test
         run: ./scripts/install-smoke.sh ./dist/microhook_${VERSION}_linux_amd64.tar.gz
 
+      - name: Run packaged-binary release e2e
+        run: ./scripts/release-e2e.sh ./dist/microhook_${VERSION}_linux_amd64.tar.gz
+
       - name: Verify systemd unit
         run: ./scripts/verify-systemd.sh
 

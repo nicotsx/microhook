@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -28,6 +29,14 @@ type Server struct {
 type contextKey string
 
 const requestLogStateContextKey contextKey = "httpapi.request-log-state"
+
+const (
+	maxInvokeActionRequestBodyBytes = 1 << 20
+	readTimeout                     = 15 * time.Second
+	writeTimeout                    = 30 * time.Second
+)
+
+var errRequestBodyTooLarge = errors.New("request body too large")
 
 type actionInvoker interface {
 	HasAction(string) bool
@@ -99,6 +108,8 @@ func New(listenAddress string, logger *slog.Logger, authService *auth.Service, e
 		Addr:              listenAddress,
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -203,7 +214,7 @@ func (s *Server) invokeAction(writer http.ResponseWriter, request *http.Request)
 		return
 	}
 
-	identity, ok := auth.IdentityFromContext(request.Context())
+	identity, ok := s.requestIdentity(request.Context())
 	if !ok || s.auth == nil {
 		writeUnauthorized(writer)
 		return
@@ -213,8 +224,12 @@ func (s *Server) invokeAction(writer http.ResponseWriter, request *http.Request)
 		return
 	}
 
-	payload, err := decodeInvokeActionRequest(request)
+	payload, err := decodeInvokeActionRequest(writer, request)
 	if err != nil {
+		if errors.Is(err, errRequestBodyTooLarge) {
+			writeJSONError(writer, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
 		writeJSONError(writer, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -271,6 +286,16 @@ func (s *Server) getRun(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
+	identity, ok := s.requestIdentity(request.Context())
+	if !ok || s.auth == nil {
+		writeUnauthorized(writer)
+		return
+	}
+	if !identity.AllowsAction(run.ActionName) {
+		writeJSONError(writer, http.StatusForbidden, http.StatusText(http.StatusForbidden))
+		return
+	}
+
 	writeJSON(writer, http.StatusOK, newRunResponse(run))
 }
 
@@ -280,8 +305,20 @@ func (s *Server) listRuns(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
+	identity, ok := s.requestIdentity(request.Context())
+	if !ok || s.auth == nil {
+		writeUnauthorized(writer)
+		return
+	}
+
+	actionName := strings.TrimSpace(request.URL.Query().Get("action"))
+	if actionName != "" && !identity.AllowsAction(actionName) {
+		writeJSONError(writer, http.StatusForbidden, http.StatusText(http.StatusForbidden))
+		return
+	}
+
 	runs, err := s.runs.ListRuns(request.Context(), storage.RunFilter{
-		ActionName: request.URL.Query().Get("action"),
+		ActionName: actionName,
 		Status:     request.URL.Query().Get("status"),
 	})
 	if err != nil {
@@ -292,6 +329,16 @@ func (s *Server) listRuns(writer http.ResponseWriter, request *http.Request) {
 
 		writeJSONError(writer, http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError))
 		return
+	}
+
+	if !identity.IsGlobal() {
+		filtered := runs[:0]
+		for _, run := range runs {
+			if identity.AllowsAction(run.ActionName) {
+				filtered = append(filtered, run)
+			}
+		}
+		runs = filtered
 	}
 
 	response := make([]runResponse, 0, len(runs))
@@ -320,19 +367,39 @@ func (s *Server) writeInvocationError(writer http.ResponseWriter, err error) {
 	}
 }
 
-func decodeInvokeActionRequest(request *http.Request) (invokeActionRequest, error) {
+func decodeInvokeActionRequest(writer http.ResponseWriter, request *http.Request) (invokeActionRequest, error) {
 	var payload invokeActionRequest
+	request.Body = http.MaxBytesReader(writer, request.Body, maxInvokeActionRequestBodyBytes)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&payload); err != nil {
+		if isRequestBodyTooLarge(err) {
+			return invokeActionRequest{}, fmt.Errorf("request body must be at most %d bytes: %w", maxInvokeActionRequestBodyBytes, errRequestBodyTooLarge)
+		}
 		return invokeActionRequest{}, errors.New("request body must be valid JSON")
 	}
 	var extra json.RawMessage
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if isRequestBodyTooLarge(err) {
+			return invokeActionRequest{}, fmt.Errorf("request body must be at most %d bytes: %w", maxInvokeActionRequestBodyBytes, errRequestBodyTooLarge)
+		}
 		return invokeActionRequest{}, errors.New("request body must contain a single JSON object")
 	}
 
 	return payload, nil
+}
+
+func (s *Server) requestIdentity(ctx context.Context) (auth.Identity, bool) {
+	if s.auth == nil {
+		return auth.Identity{}, false
+	}
+
+	return auth.IdentityFromContext(ctx)
+}
+
+func isRequestBodyTooLarge(err error) bool {
+	var maxBytesErr *http.MaxBytesError
+	return errors.As(err, &maxBytesErr)
 }
 
 func extractRequestID(request *http.Request, input json.RawMessage) string {

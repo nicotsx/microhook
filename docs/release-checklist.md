@@ -5,6 +5,7 @@
 - `go test ./...`
 - `VERSION=<tag> make release-artifacts`
 - `./scripts/install-smoke.sh dist/microhook_<tag>_linux_amd64.tar.gz`
+- `./scripts/release-e2e.sh dist/microhook_<tag>_linux_amd64.tar.gz`
 - `./scripts/verify-systemd.sh`
 - `docker build -t microhook:<tag> .`
 
@@ -18,6 +19,7 @@
 - Invalid config failure: `TestLoadRejectsInvalidConfig`, `TestLoadRejectsMalformedSections`, `TestValidateConfigRejectsInvalidConfig`
 - Logging and token redaction: `TestProtectedRoutesRequireAuth`, `TestServerLogsStructuredRequestEventsWithoutLeakingTokens`
 - Minimal child environment: `TestServiceInvokeCommandModePassesInputAndMetadata`
+- Packaged-binary Linux e2e: `scripts/release-e2e.sh` covers release-tarball startup, auth failures, sync/async execution, reject concurrency, timeout handling, restart recovery, and persisted filtered listing after restart.
 
 ## Manual Release Sign-Off
 

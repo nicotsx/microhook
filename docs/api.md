@@ -8,6 +8,8 @@ All `/v1/...` endpoints require `Authorization: Bearer <token>`.
 
 Tokens may be global or scoped to a subset of actions.
 
+Scoped tokens can read and invoke only the actions they are allowed to access.
+
 ## Endpoints
 
 ### `POST /v1/actions/:name/runs`
@@ -31,6 +33,7 @@ Notes:
 - `mode` is required and must be `sync` or `async`.
 - `input` may be any JSON value.
 - If `X-Request-Id` is set, it overrides `input.request_id` for request tracking.
+- Request bodies are limited to 1 MiB.
 
 Sync response example:
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -194,6 +195,99 @@ func TestActionRoutesEnforceScopedAuthorization(t *testing.T) {
 	}
 }
 
+func TestRunReadRoutesEnforceScopedAuthorization(t *testing.T) {
+	fixture := newServerFixture(t, []config.Action{
+		testAction("deploy", "printf deployed", "allow"),
+		testAction("restart", "printf restarted", "allow"),
+	})
+	ctx := context.Background()
+
+	for _, run := range []storage.CreateRunParams{
+		{
+			ID:         "run-deploy",
+			ActionName: "deploy",
+			Status:     storage.RunStatusSucceeded,
+			CreatedAt:  time.Date(2026, time.April, 21, 10, 15, 0, 0, time.UTC),
+			StdoutTail: "deploy-output",
+			ActionSnapshot: storage.ActionSnapshot{
+				Description:       "Deploy",
+				Mode:              config.ActionModeCommand,
+				Command:           []string{"/bin/sh", "-c", "printf deployed"},
+				Timeout:           time.Second,
+				ConcurrencyPolicy: "allow",
+				MaxOutputBytes:    1024,
+				Enabled:           true,
+			},
+		},
+		{
+			ID:         "run-restart",
+			ActionName: "restart",
+			Status:     storage.RunStatusSucceeded,
+			CreatedAt:  time.Date(2026, time.April, 21, 10, 16, 0, 0, time.UTC),
+			StdoutTail: "restart-output",
+			ActionSnapshot: storage.ActionSnapshot{
+				Description:       "Restart",
+				Mode:              config.ActionModeCommand,
+				Command:           []string{"/bin/sh", "-c", "printf restarted"},
+				Timeout:           time.Second,
+				ConcurrencyPolicy: "allow",
+				MaxOutputBytes:    1024,
+				Enabled:           true,
+			},
+		},
+	} {
+		if _, err := fixture.store.CreateRun(ctx, run); err != nil {
+			t.Fatalf("create run %q: %v", run.ID, err)
+		}
+	}
+
+	t.Run("list returns only allowed actions", func(t *testing.T) {
+		response := fixture.doRequest(http.MethodGet, "/v1/runs", "", fixture.scopedToken, "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, response.Code)
+		}
+
+		var runs []runResponse
+		decodeResponseJSON(t, response, &runs)
+		if len(runs) != 1 {
+			t.Fatalf("expected 1 run, got %d", len(runs))
+		}
+		if runs[0].Action != "deploy" {
+			t.Fatalf("expected action %q, got %q", "deploy", runs[0].Action)
+		}
+	})
+
+	t.Run("list rejects unauthorized action filter", func(t *testing.T) {
+		response := fixture.doRequest(http.MethodGet, "/v1/runs?action=restart", "", fixture.scopedToken, "")
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("expected status %d, got %d", http.StatusForbidden, response.Code)
+		}
+	})
+
+	t.Run("get rejects unauthorized run", func(t *testing.T) {
+		response := fixture.doRequest(http.MethodGet, "/v1/runs/run-restart", "", fixture.scopedToken, "")
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("expected status %d, got %d", http.StatusForbidden, response.Code)
+		}
+	})
+
+	t.Run("get allows authorized run", func(t *testing.T) {
+		response := fixture.doRequest(http.MethodGet, "/v1/runs/run-deploy", "", fixture.scopedToken, "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, response.Code)
+		}
+
+		var run runResponse
+		decodeResponseJSON(t, response, &run)
+		if run.Action != "deploy" {
+			t.Fatalf("expected action %q, got %q", "deploy", run.Action)
+		}
+		if run.StdoutTail != "deploy-output" {
+			t.Fatalf("expected stdout tail %q, got %q", "deploy-output", run.StdoutTail)
+		}
+	})
+}
+
 func TestInvokeActionSyncReturnsCompletedRun(t *testing.T) {
 	fixture := newServerFixture(t, []config.Action{
 		testAction("deploy", `cat >/dev/null; printf deploy-ok; printf deploy-warn >&2`, "allow"),
@@ -325,6 +419,24 @@ func TestInvokeActionBadRequestConflictAndNotFound(t *testing.T) {
 
 		fixture.waitForRun(t, accepted.ID)
 	})
+}
+
+func TestInvokeActionRejectsOversizedRequestBody(t *testing.T) {
+	fixture := newServerFixture(t, []config.Action{
+		testAction("deploy", `printf done`, "allow"),
+	})
+
+	body := `{"mode":"sync","input":"` + strings.Repeat("a", maxInvokeActionRequestBodyBytes) + `"}`
+	response := fixture.doRequest(http.MethodPost, "/v1/actions/deploy/runs", body, fixture.globalToken, "")
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status %d, got %d", http.StatusRequestEntityTooLarge, response.Code)
+	}
+
+	var errorBody errorResponse
+	decodeResponseJSON(t, response, &errorBody)
+	if !strings.Contains(errorBody.Error, "at most") {
+		t.Fatalf("expected oversized body error, got %q", errorBody.Error)
+	}
 }
 
 func TestListRunsSupportsActionAndStatusFilters(t *testing.T) {
@@ -472,6 +584,17 @@ func TestServerLogsStructuredRequestEventsWithoutLeakingTokens(t *testing.T) {
 	})
 }
 
+func TestServerConfiguresRequestTimeouts(t *testing.T) {
+	server := New("127.0.0.1:0", slog.Default(), newTestAuthService(t).service, nil, nil)
+
+	if server.server.ReadTimeout != readTimeout {
+		t.Fatalf("expected read timeout %s, got %s", readTimeout, server.server.ReadTimeout)
+	}
+	if server.server.WriteTimeout != writeTimeout {
+		t.Fatalf("expected write timeout %s, got %s", writeTimeout, server.server.WriteTimeout)
+	}
+}
+
 type serverFixture struct {
 	server      *Server
 	store       *storage.Store
@@ -615,11 +738,5 @@ func decodeResponseJSON(t *testing.T, response *httptest.ResponseRecorder, targe
 }
 
 func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(values, target)
 }
