@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nicotsx/microhook/internal/auth/tokenformat"
 	"github.com/nicotsx/microhook/internal/buildinfo"
 )
 
@@ -33,6 +34,25 @@ storage:
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("expected no stdout output, got %q", stdout.String())
+	}
+}
+
+func TestGenerateTokenPrintsValidToken(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := Execute(context.Background(), []string{"generate-token"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("expected zero exit code, got %d with stderr %q", exitCode, stderr.String())
+	}
+
+	token := strings.TrimSpace(stdout.String())
+	if err := tokenformat.Validate(token); err != nil {
+		t.Fatalf("expected generated token to validate: %v", err)
+	}
+
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr output, got %q", stderr.String())
 	}
 }
 

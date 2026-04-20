@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nicotsx/microhook/internal/app"
+	"github.com/nicotsx/microhook/internal/auth/tokenformat"
 	"github.com/nicotsx/microhook/internal/buildinfo"
 	"github.com/nicotsx/microhook/internal/config"
 )
@@ -50,6 +51,8 @@ func (r Runner) Run(ctx context.Context, args []string) int {
 		return r.runServe(ctx, args[1:])
 	case "validate-config":
 		return r.runValidateConfig(args[1:])
+	case "generate-token":
+		return r.runGenerateToken(args[1:])
 	case "version":
 		return r.runVersion(args[1:])
 	case "help", "-h", "--help":
@@ -194,6 +197,34 @@ func (r Runner) runValidateConfig(args []string) int {
 	return 0
 }
 
+func (r Runner) runGenerateToken(args []string) int {
+	flagSet := newFlagSet("generate-token", r.stderr)
+	if err := flagSet.Parse(args); err != nil {
+		return flagExitCode(err)
+	}
+
+	if flagSet.NArg() != 0 {
+		if err := r.writef(r.stderr, "generate-token does not accept positional arguments: %s\n", strings.Join(flagSet.Args(), " ")); err != nil {
+			return 1
+		}
+		return 2
+	}
+
+	token, err := tokenformat.Generate()
+	if err != nil {
+		if writeErr := r.writef(r.stderr, "generate token: %v\n", err); writeErr != nil {
+			return 1
+		}
+		return 1
+	}
+
+	if err := r.writeln(r.stdout, token); err != nil {
+		return 1
+	}
+
+	return 0
+}
+
 func (r Runner) runVersion(args []string) int {
 	flagSet := newFlagSet("version", r.stderr)
 	if err := flagSet.Parse(args); err != nil {
@@ -222,6 +253,7 @@ func (r Runner) printUsage() error {
 		"",
 		"Commands:",
 		"  serve             Start the Microhook service",
+		"  generate-token    Print a new bearer token",
 		"  validate-config   Validate the Microhook config file",
 		"  version           Print build metadata",
 	} {
