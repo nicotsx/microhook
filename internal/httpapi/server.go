@@ -25,6 +25,10 @@ type Server struct {
 	exec   actionInvoker
 }
 
+type contextKey string
+
+const requestLogStateContextKey contextKey = "httpapi.request-log-state"
+
 type actionInvoker interface {
 	HasAction(string) bool
 	Invoke(context.Context, execution.InvokeParams) (storage.Run, error)
@@ -64,6 +68,15 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type requestLogState struct {
+	requestID string
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
 func New(listenAddress string, logger *slog.Logger, authService *auth.Service, executor actionInvoker, runs runReader) *Server {
 	server := &Server{
 		logger: logger,
@@ -73,6 +86,7 @@ func New(listenAddress string, logger *slog.Logger, authService *auth.Service, e
 	}
 
 	router := chi.NewRouter()
+	router.Use(server.observeRequests)
 	router.HandleFunc("/healthz", healthz)
 	router.Route("/v1", func(r chi.Router) {
 		r.Use(authenticate(authService))
@@ -126,6 +140,43 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.server.Shutdown(ctx)
 }
 
+func (s *Server) observeRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		startedAt := time.Now()
+		state := &requestLogState{requestID: headerRequestID(request)}
+		if state.requestID != "" {
+			writer.Header().Set("X-Request-Id", state.requestID)
+		}
+
+		recorder := &statusRecorder{ResponseWriter: writer, status: http.StatusOK}
+		request = request.WithContext(context.WithValue(request.Context(), requestLogStateContextKey, state))
+		next.ServeHTTP(recorder, request)
+
+		if s.logger == nil {
+			return
+		}
+
+		route := request.URL.Path
+		if routeContext := chi.RouteContext(request.Context()); routeContext != nil {
+			if pattern := strings.TrimSpace(routeContext.RoutePattern()); pattern != "" {
+				route = pattern
+			}
+		}
+
+		attrs := []any{
+			"method", request.Method,
+			"route", route,
+			"status", recorder.status,
+			"duration_ms", time.Since(startedAt).Milliseconds(),
+		}
+		if state.requestID != "" {
+			attrs = append(attrs, "request_id", state.requestID)
+		}
+
+		s.logger.Log(request.Context(), levelForHTTPStatus(recorder.status), "http request completed", attrs...)
+	})
+}
+
 func healthz(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		writer.Header().Set("Allow", http.MethodGet)
@@ -175,6 +226,7 @@ func (s *Server) invokeAction(writer http.ResponseWriter, request *http.Request)
 	}
 
 	requestID := extractRequestID(request, payload.Input)
+	setRequestID(writer, request.Context(), requestID)
 	requestMetadata, err := json.Marshal(requestMetadata{Mode: mode, RequestID: requestID})
 	if err != nil {
 		writeJSONError(writer, http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError))
@@ -198,6 +250,7 @@ func (s *Server) invokeAction(writer http.ResponseWriter, request *http.Request)
 		status = http.StatusAccepted
 	}
 
+	s.logActionInvocation(request.Context(), run, mode, requestID)
 	writeJSON(writer, status, newRunResponse(run))
 }
 
@@ -283,10 +336,8 @@ func decodeInvokeActionRequest(request *http.Request) (invokeActionRequest, erro
 }
 
 func extractRequestID(request *http.Request, input json.RawMessage) string {
-	if request != nil {
-		if requestID := strings.TrimSpace(request.Header.Get("X-Request-Id")); requestID != "" {
-			return requestID
-		}
+	if requestID := headerRequestID(request); requestID != "" {
+		return requestID
 	}
 
 	if len(input) == 0 {
@@ -311,6 +362,66 @@ func extractRequestID(request *http.Request, input json.RawMessage) string {
 	return strings.TrimSpace(requestID)
 }
 
+func headerRequestID(request *http.Request) string {
+	if request == nil {
+		return ""
+	}
+
+	return strings.TrimSpace(request.Header.Get("X-Request-Id"))
+}
+
+func setRequestID(writer http.ResponseWriter, ctx context.Context, requestID string) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return
+	}
+
+	writer.Header().Set("X-Request-Id", requestID)
+	if state, ok := requestLogStateFromContext(ctx); ok {
+		state.requestID = requestID
+	}
+}
+
+func requestLogStateFromContext(ctx context.Context) (*requestLogState, bool) {
+	state, ok := ctx.Value(requestLogStateContextKey).(*requestLogState)
+	return state, ok
+}
+
+func levelForHTTPStatus(status int) slog.Level {
+	switch {
+	case status >= http.StatusInternalServerError:
+		return slog.LevelError
+	case status >= http.StatusBadRequest:
+		return slog.LevelWarn
+	default:
+		return slog.LevelInfo
+	}
+}
+
+func (s *Server) logActionInvocation(ctx context.Context, run storage.Run, mode, requestID string) {
+	if s.logger == nil {
+		return
+	}
+
+	attrs := []any{
+		"action", run.ActionName,
+		"mode", mode,
+		"run_id", run.ID,
+		"run_status", run.Status,
+	}
+	if requestID != "" {
+		attrs = append(attrs, "request_id", requestID)
+	}
+	if run.ExitCode != nil {
+		attrs = append(attrs, "exit_code", *run.ExitCode)
+	}
+	if run.TimedOut {
+		attrs = append(attrs, "timed_out", true)
+	}
+
+	s.logger.InfoContext(ctx, "action invocation handled", attrs...)
+}
+
 func newRunResponse(run storage.Run) runResponse {
 	return runResponse{
 		ID:              run.ID,
@@ -326,6 +437,11 @@ func newRunResponse(run storage.Run) runResponse {
 		StderrTail:      run.StderrTail,
 		ErrorSummary:    run.ErrorSummary,
 	}
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
 }
 
 func writeJSON(writer http.ResponseWriter, status int, value any) {

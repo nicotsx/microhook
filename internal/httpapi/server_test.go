@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -224,6 +225,9 @@ func TestInvokeActionSyncReturnsCompletedRun(t *testing.T) {
 	if body.StderrTail != "deploy-warn" {
 		t.Fatalf("expected stderr tail %q, got %q", "deploy-warn", body.StderrTail)
 	}
+	if requestID := response.Result().Header.Get("X-Request-Id"); requestID != "req-123" {
+		t.Fatalf("expected response request id %q, got %q", "req-123", requestID)
+	}
 
 	var metadata requestMetadata
 	if err := json.Unmarshal(body.RequestMetadata, &metadata); err != nil {
@@ -254,6 +258,9 @@ func TestInvokeActionAsyncReturnsAcceptedRunAndSupportsLookup(t *testing.T) {
 	}
 	if accepted.Status != storage.RunStatusRunning {
 		t.Fatalf("expected async accepted status %q, got %q", storage.RunStatusRunning, accepted.Status)
+	}
+	if requestID := response.Result().Header.Get("X-Request-Id"); requestID != "header-id" {
+		t.Fatalf("expected response request id %q, got %q", "header-id", requestID)
 	}
 
 	completed := fixture.waitForRun(t, accepted.ID)
@@ -430,6 +437,80 @@ func TestListRunsSupportsActionAndStatusFilters(t *testing.T) {
 	}
 }
 
+func TestServerLogsStructuredRequestEventsWithoutLeakingTokens(t *testing.T) {
+	t.Run("json", func(t *testing.T) {
+		var buffer bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&buffer, nil))
+		fixture := newServerFixtureWithLogger(t, logger, []config.Action{
+			testAction("deploy", `printf deploy-ok`, "allow"),
+		})
+
+		response := fixture.doRequest(http.MethodPost, "/v1/actions/deploy/runs", `{"mode":"sync","input":{"request_id":"req-123"}}`, fixture.globalToken, "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, response.Code)
+		}
+
+		lines := strings.Split(strings.TrimSpace(buffer.String()), "\n")
+		if len(lines) < 2 {
+			t.Fatalf("expected at least 2 log lines, got %d: %q", len(lines), buffer.String())
+		}
+
+		var messages []string
+		for _, line := range lines {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+
+			var entry map[string]any
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				t.Fatalf("expected JSON log line, got error %v for %q", err, line)
+			}
+
+			msg, _ := entry["msg"].(string)
+			messages = append(messages, msg)
+		}
+
+		logs := buffer.String()
+		for _, expected := range []string{"http request completed", "action invocation handled", "request_id", "run_id", "route", "status"} {
+			if !strings.Contains(logs, expected) {
+				t.Fatalf("expected logs to contain %q, got %q", expected, logs)
+			}
+		}
+		if !containsString(messages, "http request completed") {
+			t.Fatalf("expected request completion log message, got %v", messages)
+		}
+		if !containsString(messages, "action invocation handled") {
+			t.Fatalf("expected action invocation log message, got %v", messages)
+		}
+		if strings.Contains(logs, fixture.globalToken) {
+			t.Fatalf("expected logs not to contain bearer token, got %q", logs)
+		}
+	})
+
+	t.Run("text", func(t *testing.T) {
+		var buffer bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buffer, nil))
+		fixture := newServerFixtureWithLogger(t, logger, []config.Action{
+			testAction("deploy", `printf deploy-ok`, "allow"),
+		})
+
+		response := fixture.doRequest(http.MethodPost, "/v1/actions/deploy/runs", `{"mode":"sync","input":{"request_id":"req-123"}}`, fixture.globalToken, "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, response.Code)
+		}
+
+		logs := buffer.String()
+		for _, expected := range []string{"msg=\"http request completed\"", "msg=\"action invocation handled\"", "request_id=req-123", "run_id=", "route=/v1/actions/{name}/runs", "status=200"} {
+			if !strings.Contains(logs, expected) {
+				t.Fatalf("expected logs to contain %q, got %q", expected, logs)
+			}
+		}
+		if strings.Contains(logs, fixture.globalToken) {
+			t.Fatalf("expected logs not to contain bearer token, got %q", logs)
+		}
+	})
+}
+
 type serverFixture struct {
 	server      *Server
 	store       *storage.Store
@@ -438,6 +519,10 @@ type serverFixture struct {
 }
 
 func newServerFixture(t *testing.T, actions []config.Action) serverFixture {
+	return newServerFixtureWithLogger(t, slog.Default(), actions)
+}
+
+func newServerFixtureWithLogger(t *testing.T, logger *slog.Logger, actions []config.Action) serverFixture {
 	t.Helper()
 
 	authFixture := newTestAuthService(t)
@@ -452,7 +537,7 @@ func newServerFixture(t *testing.T, actions []config.Action) serverFixture {
 	})
 
 	executor := execution.New(store, config.Config{Actions: actions}.ActionRegistry())
-	server := New("127.0.0.1:0", slog.Default(), authFixture.service, executor, store)
+	server := New("127.0.0.1:0", logger, authFixture.service, executor, store)
 
 	return serverFixture{
 		server:      server,
@@ -566,4 +651,14 @@ func decodeResponseJSON(t *testing.T, response *httptest.ResponseRecorder, targe
 	if err := json.Unmarshal(response.Body.Bytes(), target); err != nil {
 		t.Fatalf("decode response json: %v\nbody=%s", err, response.Body.String())
 	}
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+
+	return false
 }
