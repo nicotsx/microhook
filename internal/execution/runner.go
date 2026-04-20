@@ -244,29 +244,6 @@ func actionFromSnapshot(name string, snapshot storage.ActionSnapshot) config.Act
 	}
 }
 
-func requestIDFromMetadata(metadata json.RawMessage) string {
-	if len(metadata) == 0 {
-		return ""
-	}
-
-	var values map[string]json.RawMessage
-	if err := json.Unmarshal(metadata, &values); err != nil {
-		return ""
-	}
-
-	rawRequestID, ok := values["request_id"]
-	if !ok {
-		return ""
-	}
-
-	var requestID string
-	if err := json.Unmarshal(rawRequestID, &requestID); err != nil {
-		return ""
-	}
-
-	return strings.TrimSpace(requestID)
-}
-
 func executionContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		return context.WithCancel(ctx)

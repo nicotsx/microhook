@@ -1,0 +1,5 @@
+bin/
+dist/
+microhook
+microhook.db
+/.DS_Store

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	_ "embed"
 	"errors"
 	"fmt"
 	"net/url"
@@ -10,12 +11,17 @@ import (
 	"path/filepath"
 	"strings"
 
+	storedb "github.com/nicotsx/microhook/internal/storage/sqlc"
 	_ "modernc.org/sqlite"
 )
 
+//go:embed sql/storage_schemas.sql
+var storageSchemaSQL string
+
 type Store struct {
-	db   *sql.DB
-	path string
+	db      *sql.DB
+	queries *storedb.Queries
+	path    string
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -55,7 +61,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, initErr
 	}
 
-	return &Store{db: db, path: cleanPath}, nil
+	return &Store{db: db, queries: storedb.New(db), path: cleanPath}, nil
 }
 
 func (s *Store) Close() error {
@@ -96,51 +102,8 @@ func initialize(ctx context.Context, db *sql.DB) error {
 		}
 	}()
 
-	for _, statement := range []string{
-		`
-CREATE TABLE IF NOT EXISTS microhook_metadata (
-	key TEXT PRIMARY KEY,
-	value TEXT NOT NULL
-)
-`,
-		`
-CREATE TABLE IF NOT EXISTS microhook_runs (
-	id TEXT PRIMARY KEY,
-	action_name TEXT NOT NULL,
-	status TEXT NOT NULL,
-	exit_code INTEGER,
-	created_at_unix_nano INTEGER NOT NULL,
-	started_at_unix_nano INTEGER,
-	finished_at_unix_nano INTEGER,
-	timed_out INTEGER NOT NULL DEFAULT 0,
-	request_metadata_json BLOB,
-	stdout_tail TEXT NOT NULL DEFAULT '',
-	stderr_tail TEXT NOT NULL DEFAULT '',
-	error_summary TEXT NOT NULL DEFAULT ''
-)
-`,
-		`
-CREATE TABLE IF NOT EXISTS microhook_action_snapshots (
-	run_id TEXT PRIMARY KEY REFERENCES microhook_runs(id) ON DELETE CASCADE,
-	description TEXT NOT NULL,
-	mode TEXT NOT NULL,
-	command_json BLOB NOT NULL,
-	shell_command TEXT NOT NULL,
-	cwd TEXT NOT NULL,
-	timeout_nanoseconds INTEGER NOT NULL,
-	env_json BLOB NOT NULL,
-	concurrency_policy TEXT NOT NULL,
-	max_output_bytes INTEGER NOT NULL,
-	enabled INTEGER NOT NULL
-)
-`,
-		`CREATE INDEX IF NOT EXISTS idx_microhook_runs_action_created ON microhook_runs(action_name, created_at_unix_nano DESC, id DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_microhook_runs_status_created ON microhook_runs(status, created_at_unix_nano DESC, id DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_microhook_runs_created ON microhook_runs(created_at_unix_nano DESC, id DESC)`,
-	} {
-		if _, err := tx.ExecContext(ctx, statement); err != nil {
-			return err
-		}
+	if _, err := tx.ExecContext(ctx, storageSchemaSQL); err != nil {
+		return fmt.Errorf("apply schema bootstrap: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {

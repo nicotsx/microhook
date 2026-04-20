@@ -10,41 +10,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	storedb "github.com/nicotsx/microhook/internal/storage/sqlc"
 )
 
 const retentionLastPrunedAtKey = "retention_last_pruned_at_unix_nano"
-
-const runSelectColumns = `
-SELECT
-	r.id,
-	r.action_name,
-	r.status,
-	r.exit_code,
-	r.created_at_unix_nano,
-	r.started_at_unix_nano,
-	r.finished_at_unix_nano,
-	r.timed_out,
-	r.request_metadata_json,
-	r.stdout_tail,
-	r.stderr_tail,
-	r.error_summary,
-	s.description,
-	s.mode,
-	s.command_json,
-	s.shell_command,
-	s.cwd,
-	s.timeout_nanoseconds,
-	s.env_json,
-	s.concurrency_policy,
-	s.max_output_bytes,
-	s.enabled
-FROM microhook_runs r
-JOIN microhook_action_snapshots s ON s.run_id = r.id`
-
-type metadataStore interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}
 
 func (s *Store) CreateRun(ctx context.Context, params CreateRunParams) (Run, error) {
 	if strings.TrimSpace(params.ID) == "" {
@@ -94,63 +64,35 @@ func (s *Store) CreateRun(ctx context.Context, params CreateRunParams) (Run, err
 		}
 	}()
 
-	_, err = tx.ExecContext(ctx, `
-INSERT INTO microhook_runs (
-	id,
-	action_name,
-	status,
-	created_at_unix_nano,
-	started_at_unix_nano,
-	timed_out,
-	request_metadata_json,
-	stdout_tail,
-	stderr_tail,
-	error_summary
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`,
-		params.ID,
-		params.ActionName,
-		params.Status,
-		createdAt.UnixNano(),
-		startedAtValue,
-		0,
-		requestMetadata,
-		params.StdoutTail,
-		params.StderrTail,
-		params.ErrorSummary,
-	)
-	if err != nil {
+	queries := s.queries.WithTx(tx)
+	if err := queries.CreateRun(ctx, storedb.CreateRunParams{
+		ID:                  params.ID,
+		ActionName:          params.ActionName,
+		Status:              params.Status,
+		CreatedAtUnixNano:   createdAt.UnixNano(),
+		StartedAtUnixNano:   startedAtValue,
+		TimedOut:            0,
+		RequestMetadataJson: requestMetadata,
+		StdoutTail:          params.StdoutTail,
+		StderrTail:          params.StderrTail,
+		ErrorSummary:        params.ErrorSummary,
+	}); err != nil {
 		return Run{}, fmt.Errorf("create run %q: insert run row: %w", params.ID, err)
 	}
 
-	_, err = tx.ExecContext(ctx, `
-INSERT INTO microhook_action_snapshots (
-	run_id,
-	description,
-	mode,
-	command_json,
-	shell_command,
-	cwd,
-	timeout_nanoseconds,
-	env_json,
-	concurrency_policy,
-	max_output_bytes,
-	enabled
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`,
-		params.ID,
-		params.ActionSnapshot.Description,
-		params.ActionSnapshot.Mode,
-		commandJSON,
-		params.ActionSnapshot.ShellCommand,
-		params.ActionSnapshot.Cwd,
-		int64(params.ActionSnapshot.Timeout),
-		envJSON,
-		params.ActionSnapshot.ConcurrencyPolicy,
-		params.ActionSnapshot.MaxOutputBytes,
-		boolToInt(params.ActionSnapshot.Enabled),
-	)
-	if err != nil {
+	if err := queries.CreateActionSnapshot(ctx, storedb.CreateActionSnapshotParams{
+		RunID:              params.ID,
+		Description:        params.ActionSnapshot.Description,
+		Mode:               params.ActionSnapshot.Mode,
+		CommandJson:        commandJSON,
+		ShellCommand:       params.ActionSnapshot.ShellCommand,
+		Cwd:                params.ActionSnapshot.Cwd,
+		TimeoutNanoseconds: int64(params.ActionSnapshot.Timeout),
+		EnvJson:            envJSON,
+		ConcurrencyPolicy:  params.ActionSnapshot.ConcurrencyPolicy,
+		MaxOutputBytes:     int64(params.ActionSnapshot.MaxOutputBytes),
+		Enabled:            boolToInt64(params.ActionSnapshot.Enabled),
+	}); err != nil {
 		return Run{}, fmt.Errorf("create run %q: insert action snapshot: %w", params.ID, err)
 	}
 
@@ -179,36 +121,19 @@ func (s *Store) UpdateRun(ctx context.Context, params UpdateRunParams) error {
 		return fmt.Errorf("update run %q: %w", params.ID, err)
 	}
 
-	result, err := s.db.ExecContext(ctx, `
-UPDATE microhook_runs
-SET
-	status = ?,
-	exit_code = ?,
-	started_at_unix_nano = ?,
-	finished_at_unix_nano = ?,
-	timed_out = ?,
-	stdout_tail = ?,
-	stderr_tail = ?,
-	error_summary = ?
-WHERE id = ?
-`,
-		params.Status,
-		nullableInt64(params.ExitCode),
-		startedAtValue,
-		finishedAtValue,
-		boolToInt(params.TimedOut),
-		params.StdoutTail,
-		params.StderrTail,
-		params.ErrorSummary,
-		params.ID,
-	)
+	affected, err := s.queries.UpdateRun(ctx, storedb.UpdateRunParams{
+		Status:             params.Status,
+		ExitCode:           nullableInt64(params.ExitCode),
+		StartedAtUnixNano:  startedAtValue,
+		FinishedAtUnixNano: finishedAtValue,
+		TimedOut:           boolToInt64(params.TimedOut),
+		StdoutTail:         params.StdoutTail,
+		StderrTail:         params.StderrTail,
+		ErrorSummary:       params.ErrorSummary,
+		ID:                 params.ID,
+	})
 	if err != nil {
 		return fmt.Errorf("update run %q: %w", params.ID, err)
-	}
-
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("update run %q: read affected rows: %w", params.ID, err)
 	}
 	if affected == 0 {
 		return fmt.Errorf("update run %q: %w", params.ID, ErrRunNotFound)
@@ -222,11 +147,7 @@ func (s *Store) GetRun(ctx context.Context, id string) (Run, error) {
 		return Run{}, fmt.Errorf("get run: %w: run id is required", ErrInvalidRunState)
 	}
 
-	row := s.db.QueryRowContext(ctx, runSelectColumns+`
-WHERE r.id = ?
-`, id)
-
-	run, err := scanRun(row)
+	record, err := s.queries.GetRun(ctx, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Run{}, fmt.Errorf("get run %q: %w", id, ErrRunNotFound)
@@ -234,49 +155,47 @@ WHERE r.id = ?
 		return Run{}, fmt.Errorf("get run %q: %w", id, err)
 	}
 
+	run, err := runFromRecord(record)
+	if err != nil {
+		return Run{}, fmt.Errorf("get run %q: %w", id, err)
+	}
+
 	return run, nil
 }
 
 func (s *Store) ListRuns(ctx context.Context, filter RunFilter) ([]Run, error) {
-	args := make([]any, 0, 2)
-	conditions := make([]string, 0, 2)
-
-	if actionName := strings.TrimSpace(filter.ActionName); actionName != "" {
-		conditions = append(conditions, "r.action_name = ?")
-		args = append(args, actionName)
-	}
-	if status := strings.TrimSpace(filter.Status); status != "" {
+	actionName := strings.TrimSpace(filter.ActionName)
+	status := strings.TrimSpace(filter.Status)
+	if status != "" {
 		if err := validateRunStatus(status); err != nil {
 			return nil, fmt.Errorf("list runs: %w", err)
 		}
-		conditions = append(conditions, "r.status = ?")
-		args = append(args, status)
 	}
 
-	var query strings.Builder
-	query.WriteString(runSelectColumns)
-	if len(conditions) > 0 {
-		query.WriteString("\nWHERE ")
-		query.WriteString(strings.Join(conditions, " AND "))
-	}
-	query.WriteString("\nORDER BY r.created_at_unix_nano DESC, r.id DESC")
+	var (
+		records []storedb.MicrohookRunRecord
+		err     error
+	)
 
-	rows, err := s.db.QueryContext(ctx, query.String(), args...)
+	switch {
+	case actionName != "" && status != "":
+		records, err = s.queries.ListRunsByActionNameAndStatus(ctx, storedb.ListRunsByActionNameAndStatusParams{
+			FilterActionName: actionName,
+			FilterStatus:     status,
+		})
+	case actionName != "":
+		records, err = s.queries.ListRunsByActionName(ctx, actionName)
+	case status != "":
+		records, err = s.queries.ListRunsByStatus(ctx, status)
+	default:
+		records, err = s.queries.ListRuns(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
 	}
-	defer rows.Close()
 
-	runs := make([]Run, 0)
-	for rows.Next() {
-		run, err := scanRun(rows)
-		if err != nil {
-			return nil, fmt.Errorf("list runs: %w", err)
-		}
-		runs = append(runs, run)
-	}
-
-	if err := rows.Err(); err != nil {
+	runs, err := runsFromRecords(records)
+	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
 	}
 
@@ -299,51 +218,31 @@ func (s *Store) ApplyRetention(ctx context.Context, policy RetentionPolicy) (Ret
 		}
 	}()
 
+	queries := s.queries.WithTx(tx)
 	deletedRuns := int64(0)
 	if policy.MaxAge > 0 {
-		result, err := tx.ExecContext(ctx, `
-DELETE FROM microhook_runs
-WHERE id IN (
-	SELECT id
-	FROM microhook_runs
-	WHERE status <> ?
-	AND created_at_unix_nano < ?
-)
-`, RunStatusRunning, prunedAt.Add(-policy.MaxAge).UnixNano())
+		affected, err := queries.DeleteRunsOlderThan(ctx, storedb.DeleteRunsOlderThanParams{
+			ExcludedStatus:        RunStatusRunning,
+			CreatedBeforeUnixNano: prunedAt.Add(-policy.MaxAge).UnixNano(),
+		})
 		if err != nil {
 			return RetentionResult{}, fmt.Errorf("apply retention: prune by age: %w", err)
-		}
-
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return RetentionResult{}, fmt.Errorf("apply retention: prune by age affected rows: %w", err)
 		}
 		deletedRuns += affected
 	}
 
 	if policy.MaxRuns > 0 {
-		result, err := tx.ExecContext(ctx, `
-DELETE FROM microhook_runs
-WHERE id IN (
-	SELECT id
-	FROM microhook_runs
-	WHERE status <> ?
-	ORDER BY created_at_unix_nano DESC, id DESC
-	LIMIT -1 OFFSET ?
-)
-`, RunStatusRunning, policy.MaxRuns)
+		affected, err := queries.DeleteRunsOverflow(ctx, storedb.DeleteRunsOverflowParams{
+			ExcludedStatus: RunStatusRunning,
+			MaxRuns:        int64(policy.MaxRuns),
+		})
 		if err != nil {
 			return RetentionResult{}, fmt.Errorf("apply retention: prune by max runs: %w", err)
-		}
-
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return RetentionResult{}, fmt.Errorf("apply retention: prune by max runs affected rows: %w", err)
 		}
 		deletedRuns += affected
 	}
 
-	if err := setMetadata(ctx, tx, retentionLastPrunedAtKey, strconv.FormatInt(prunedAt.UnixNano(), 10)); err != nil {
+	if err := setMetadata(ctx, queries, retentionLastPrunedAtKey, strconv.FormatInt(prunedAt.UnixNano(), 10)); err != nil {
 		return RetentionResult{}, fmt.Errorf("apply retention: set retention metadata: %w", err)
 	}
 
@@ -356,7 +255,7 @@ WHERE id IN (
 }
 
 func (s *Store) LastRetentionPruneAt(ctx context.Context) (*time.Time, error) {
-	value, ok, err := getMetadata(ctx, s.db, retentionLastPrunedAtKey)
+	value, ok, err := getMetadata(ctx, s.queries, retentionLastPrunedAtKey)
 	if err != nil {
 		return nil, fmt.Errorf("get last retention prune time: %w", err)
 	}
@@ -373,80 +272,63 @@ func (s *Store) LastRetentionPruneAt(ctx context.Context) (*time.Time, error) {
 	return &prunedAt, nil
 }
 
-type rowScanner interface {
-	Scan(...any) error
-}
-
-func scanRun(scanner rowScanner) (Run, error) {
-	var (
-		run                 Run
-		exitCode            sql.NullInt64
-		startedAtUnixNano   sql.NullInt64
-		finishedAtUnixNano  sql.NullInt64
-		requestMetadataJSON []byte
-		commandJSON         []byte
-		envJSON             []byte
-		timedOut            int
-		enabled             int
-		createdAtUnixNano   int64
-		timeoutNanoseconds  int64
-	)
-
-	err := scanner.Scan(
-		&run.ID,
-		&run.ActionName,
-		&run.Status,
-		&exitCode,
-		&createdAtUnixNano,
-		&startedAtUnixNano,
-		&finishedAtUnixNano,
-		&timedOut,
-		&requestMetadataJSON,
-		&run.StdoutTail,
-		&run.StderrTail,
-		&run.ErrorSummary,
-		&run.ActionSnapshot.Description,
-		&run.ActionSnapshot.Mode,
-		&commandJSON,
-		&run.ActionSnapshot.ShellCommand,
-		&run.ActionSnapshot.Cwd,
-		&timeoutNanoseconds,
-		&envJSON,
-		&run.ActionSnapshot.ConcurrencyPolicy,
-		&run.ActionSnapshot.MaxOutputBytes,
-		&enabled,
-	)
-	if err != nil {
-		return Run{}, err
+func runFromRecord(record storedb.MicrohookRunRecord) (Run, error) {
+	run := Run{
+		ID:              record.ID,
+		ActionName:      record.ActionName,
+		Status:          record.Status,
+		CreatedAt:       time.Unix(0, record.CreatedAtUnixNano).UTC(),
+		TimedOut:        record.TimedOut != 0,
+		RequestMetadata: cloneBytes(record.RequestMetadataJson),
+		StdoutTail:      record.StdoutTail,
+		StderrTail:      record.StderrTail,
+		ErrorSummary:    record.ErrorSummary,
+		ActionSnapshot: ActionSnapshot{
+			Description:       record.Description,
+			Mode:              record.Mode,
+			ShellCommand:      record.ShellCommand,
+			Cwd:               record.Cwd,
+			Timeout:           time.Duration(record.TimeoutNanoseconds),
+			ConcurrencyPolicy: record.ConcurrencyPolicy,
+			MaxOutputBytes:    int(record.MaxOutputBytes),
+			Enabled:           record.Enabled != 0,
+		},
 	}
 
-	run.CreatedAt = time.Unix(0, createdAtUnixNano).UTC()
-	run.TimedOut = timedOut != 0
-	run.ActionSnapshot.Timeout = time.Duration(timeoutNanoseconds)
-	run.ActionSnapshot.Enabled = enabled != 0
-	run.RequestMetadata = cloneBytes(requestMetadataJSON)
-
-	if exitCode.Valid {
-		exitCodeValue := int(exitCode.Int64)
-		run.ExitCode = &exitCodeValue
+	if record.ExitCode.Valid {
+		exitCode := int(record.ExitCode.Int64)
+		run.ExitCode = &exitCode
 	}
-	if startedAtUnixNano.Valid {
-		startedAt := time.Unix(0, startedAtUnixNano.Int64).UTC()
+	if record.StartedAtUnixNano.Valid {
+		startedAt := time.Unix(0, record.StartedAtUnixNano.Int64).UTC()
 		run.StartedAt = &startedAt
 	}
-	if finishedAtUnixNano.Valid {
-		finishedAt := time.Unix(0, finishedAtUnixNano.Int64).UTC()
+	if record.FinishedAtUnixNano.Valid {
+		finishedAt := time.Unix(0, record.FinishedAtUnixNano.Int64).UTC()
 		run.FinishedAt = &finishedAt
 	}
 
-	if err := json.Unmarshal(commandJSON, &run.ActionSnapshot.Command); err != nil {
+	if err := json.Unmarshal(record.CommandJson, &run.ActionSnapshot.Command); err != nil {
 		return Run{}, fmt.Errorf("decode action snapshot command: %w", err)
 	}
-	if err := json.Unmarshal(envJSON, &run.ActionSnapshot.Env); err != nil {
+	if err := json.Unmarshal(record.EnvJson, &run.ActionSnapshot.Env); err != nil {
 		return Run{}, fmt.Errorf("decode action snapshot env: %w", err)
 	}
 
 	return run, nil
+}
+
+func runsFromRecords(records []storedb.MicrohookRunRecord) ([]Run, error) {
+	runs := make([]Run, 0, len(records))
+	for _, record := range records {
+		run, err := runFromRecord(record)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+
+	return runs, nil
 }
 
 func validateRunStatus(status string) error {
@@ -504,28 +386,28 @@ func normalizeTime(value time.Time) (time.Time, error) {
 	return value.UTC(), nil
 }
 
-func nullableUnixNano(value *time.Time) (any, error) {
+func nullableUnixNano(value *time.Time) (sql.NullInt64, error) {
 	if value == nil {
-		return nil, nil
+		return sql.NullInt64{}, nil
 	}
 
 	normalized, err := normalizeTime(*value)
 	if err != nil {
-		return nil, err
+		return sql.NullInt64{}, err
 	}
 
-	return normalized.UnixNano(), nil
+	return sql.NullInt64{Int64: normalized.UnixNano(), Valid: true}, nil
 }
 
-func nullableInt64(value *int) any {
+func nullableInt64(value *int) sql.NullInt64 {
 	if value == nil {
-		return nil
+		return sql.NullInt64{}
 	}
 
-	return int64(*value)
+	return sql.NullInt64{Int64: int64(*value), Valid: true}
 }
 
-func boolToInt(value bool) int {
+func boolToInt64(value bool) int64 {
 	if value {
 		return 1
 	}
@@ -564,22 +446,16 @@ func cloneStringMap(values map[string]string) map[string]string {
 	return cloned
 }
 
-func setMetadata(ctx context.Context, store metadataStore, key, value string) error {
-	_, err := store.ExecContext(ctx, `
-INSERT INTO microhook_metadata (key, value)
-VALUES (?, ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value
-`, key, value)
-	if err != nil {
+func setMetadata(ctx context.Context, queries *storedb.Queries, key, value string) error {
+	if err := queries.SetMetadata(ctx, storedb.SetMetadataParams{Key: key, Value: value}); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func getMetadata(ctx context.Context, store metadataStore, key string) (string, bool, error) {
-	var value string
-	err := store.QueryRowContext(ctx, `SELECT value FROM microhook_metadata WHERE key = ?`, key).Scan(&value)
+func getMetadata(ctx context.Context, queries *storedb.Queries, key string) (string, bool, error) {
+	value, err := queries.GetMetadata(ctx, key)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", false, nil
