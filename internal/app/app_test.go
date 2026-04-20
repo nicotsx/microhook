@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/nicotsx/microhook/internal/buildinfo"
 	"github.com/nicotsx/microhook/internal/config"
+	"github.com/nicotsx/microhook/internal/storage"
 )
 
 func TestBootstrapStartsHealthEndpointAndShutsDown(t *testing.T) {
@@ -115,6 +117,82 @@ func TestBootstrapFailsWhenStorageCannotInitialize(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "create storage directory") {
 		t.Fatalf("expected storage initialization error, got %v", err)
+	}
+}
+
+func TestBootstrapAppliesConfiguredRetentionOnStartup(t *testing.T) {
+	ctx := context.Background()
+	storagePath := filepath.Join(t.TempDir(), "microhook.db")
+	store, err := storage.Open(ctx, storagePath)
+	if err != nil {
+		t.Fatalf("open seed storage: %v", err)
+	}
+
+	oldRunCreatedAt := time.Now().Add(-72 * time.Hour).UTC()
+	if _, err := store.CreateRun(ctx, storage.CreateRunParams{
+		ID:              "old-run",
+		ActionName:      "deploy",
+		Status:          storage.RunStatusSucceeded,
+		CreatedAt:       oldRunCreatedAt,
+		RequestMetadata: json.RawMessage(`{"request_id":"seed"}`),
+		ActionSnapshot: storage.ActionSnapshot{
+			Description:       "Deploy the service",
+			Mode:              "command",
+			Command:           []string{"echo", "deploy"},
+			Cwd:               "/tmp",
+			Timeout:           time.Minute,
+			Env:               map[string]string{"ENVIRONMENT": "test"},
+			ConcurrencyPolicy: "queue",
+			MaxOutputBytes:    1024,
+			Enabled:           true,
+		},
+	}); err != nil {
+		t.Fatalf("seed old run: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close seed storage: %v", err)
+	}
+
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:    "127.0.0.1:0",
+			LogFormat: "json",
+		},
+		Storage: config.StorageConfig{
+			Path:          storagePath,
+			RetentionDays: 1,
+		},
+	}
+
+	application, err := Bootstrap(ctx, cfg, buildinfo.Current())
+	if err != nil {
+		t.Fatalf("bootstrap app: %v", err)
+	}
+	if err := application.Close(); err != nil {
+		t.Fatalf("close app: %v", err)
+	}
+
+	store, err = storage.Open(ctx, storagePath)
+	if err != nil {
+		t.Fatalf("reopen storage after bootstrap: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close storage after verification: %v", err)
+		}
+	}()
+
+	_, err = store.GetRun(ctx, "old-run")
+	if !errors.Is(err, storage.ErrRunNotFound) {
+		t.Fatalf("expected old run to be pruned during bootstrap, got %v", err)
+	}
+
+	prunedAt, err := store.LastRetentionPruneAt(ctx)
+	if err != nil {
+		t.Fatalf("read retention metadata: %v", err)
+	}
+	if prunedAt == nil || prunedAt.IsZero() {
+		t.Fatal("expected bootstrap retention to update retention metadata")
 	}
 }
 

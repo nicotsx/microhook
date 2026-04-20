@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/nicotsx/microhook/internal/auth"
 	"github.com/nicotsx/microhook/internal/buildinfo"
@@ -33,6 +34,16 @@ func Bootstrap(ctx context.Context, cfg config.Config, build buildinfo.Info) (*A
 
 	store, err := storage.Open(ctx, cfg.Storage.Path)
 	if err != nil {
+		return nil, err
+	}
+
+	if _, err := store.ApplyRetention(ctx, storage.RetentionPolicy{
+		MaxAge:  time.Duration(cfg.Storage.RetentionDays) * 24 * time.Hour,
+		MaxRuns: cfg.Storage.MaxRuns,
+	}); err != nil {
+		if closeErr := store.Close(); closeErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("close storage after retention failure: %w", closeErr))
+		}
 		return nil, err
 	}
 

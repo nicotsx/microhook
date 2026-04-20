@@ -13,6 +13,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const schemaVersion = 2
+
 type Store struct {
 	db   *sql.DB
 	path string
@@ -86,17 +88,141 @@ func sqliteDSN(path string) string {
 }
 
 func initialize(ctx context.Context, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
+	version, err := userVersion(ctx, db)
+	if err != nil {
 		return err
 	}
+	if version > schemaVersion {
+		return fmt.Errorf("unsupported storage schema version %d", version)
+	}
 
-	if _, err := db.ExecContext(ctx, `
+	for nextVersion := version + 1; nextVersion <= schemaVersion; nextVersion++ {
+		if err := applyMigration(ctx, db, nextVersion); err != nil {
+			return fmt.Errorf("apply migration %d: %w", nextVersion, err)
+		}
+	}
+
+	return nil
+}
+
+func userVersion(ctx context.Context, db *sql.DB) (int, error) {
+	var version int
+	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return 0, err
+	}
+
+	return version, nil
+}
+
+func applyMigration(ctx context.Context, db *sql.DB, version int) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	switch version {
+	case 1:
+		if err := migrateV1(ctx, tx); err != nil {
+			return err
+		}
+	case 2:
+		if err := migrateV2(ctx, tx); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown migration version %d", version)
+	}
+
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		return fmt.Errorf("set user_version to %d: %w", version, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration %d: %w", version, err)
+	}
+	tx = nil
+
+	return nil
+}
+
+func migrateV1(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS microhook_metadata (
 	key TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 )
 `); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func migrateV2(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS microhook_runs (
+	id TEXT PRIMARY KEY,
+	action_name TEXT NOT NULL,
+	status TEXT NOT NULL,
+	exit_code INTEGER,
+	created_at_unix_nano INTEGER NOT NULL,
+	started_at_unix_nano INTEGER,
+	finished_at_unix_nano INTEGER,
+	timed_out INTEGER NOT NULL DEFAULT 0,
+	request_metadata_json BLOB,
+	stdout_tail TEXT NOT NULL DEFAULT '',
+	stderr_tail TEXT NOT NULL DEFAULT '',
+	error_summary TEXT NOT NULL DEFAULT ''
+)
+`); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS microhook_action_snapshots (
+	run_id TEXT PRIMARY KEY REFERENCES microhook_runs(id) ON DELETE CASCADE,
+	description TEXT NOT NULL,
+	mode TEXT NOT NULL,
+	command_json BLOB NOT NULL,
+	shell_command TEXT NOT NULL,
+	cwd TEXT NOT NULL,
+	timeout_nanoseconds INTEGER NOT NULL,
+	env_json BLOB NOT NULL,
+	concurrency_policy TEXT NOT NULL,
+	max_output_bytes INTEGER NOT NULL,
+	enabled INTEGER NOT NULL
+)
+`); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS microhook_queued_runs (
+	queue_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+	run_id TEXT NOT NULL UNIQUE REFERENCES microhook_runs(id) ON DELETE CASCADE,
+	action_name TEXT NOT NULL,
+	enqueued_at_unix_nano INTEGER NOT NULL,
+	input_json BLOB
+)
+`); err != nil {
+		return err
+	}
+
+	statements := []string{
+		`CREATE INDEX IF NOT EXISTS idx_microhook_runs_action_created ON microhook_runs(action_name, created_at_unix_nano DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_microhook_runs_status_created ON microhook_runs(status, created_at_unix_nano DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_microhook_runs_created ON microhook_runs(created_at_unix_nano DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_microhook_queued_runs_action_sequence ON microhook_queued_runs(action_name, queue_sequence ASC)`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
 	}
 
 	return nil
