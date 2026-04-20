@@ -64,7 +64,7 @@ func Bootstrap(ctx context.Context, cfg config.Config, build buildinfo.Info) (*A
 		auth:     authService,
 		executor: executorService,
 		storage:  store,
-		http:     httpapi.New(cfg.Server.Listen, logger, authService),
+		http:     httpapi.New(cfg.Server.Listen, logger, authService, executorService, store),
 	}, nil
 }
 

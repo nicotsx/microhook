@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,6 +25,9 @@ const (
 	shellPath   = "/bin/sh"
 	defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+	InvokeModeSync  = "sync"
+	InvokeModeAsync = "async"
+
 	envRunID     = "MICROHOOK_RUN_ID"
 	envAction    = "MICROHOOK_ACTION"
 	envRequestID = "MICROHOOK_REQUEST_ID"
@@ -32,6 +36,8 @@ const (
 var (
 	ErrActionNotFound = errors.New("action not found")
 	ErrActionDisabled = errors.New("action disabled")
+	ErrActionConflict = errors.New("action already running")
+	ErrInvalidMode    = errors.New("invalid invoke mode")
 )
 
 type runStore interface {
@@ -45,13 +51,36 @@ type Service struct {
 	registry config.ActionRegistry
 	now      func() time.Time
 	newRunID func() (string, error)
+
+	mu      sync.Mutex
+	actions map[string]*actionState
 }
 
 type InvokeParams struct {
 	ActionName      string
+	Mode            string
 	Input           json.RawMessage
 	RequestMetadata json.RawMessage
 	RequestID       string
+}
+
+type actionState struct {
+	running int
+	queue   []queuedInvocation
+}
+
+type queuedInvocation struct {
+	action    config.Action
+	run       storage.Run
+	input     json.RawMessage
+	requestID string
+	runCtx    context.Context
+	waitCh    chan invokeResult
+}
+
+type invokeResult struct {
+	run storage.Run
+	err error
 }
 
 func New(store runStore, registry config.ActionRegistry) *Service {
@@ -62,6 +91,7 @@ func New(store runStore, registry config.ActionRegistry) *Service {
 			return time.Now().UTC()
 		},
 		newRunID: generateRunID,
+		actions:  make(map[string]*actionState),
 	}
 }
 
@@ -90,27 +120,308 @@ func (s *Service) Invoke(ctx context.Context, params InvokeParams) (storage.Run,
 		return storage.Run{}, fmt.Errorf("invoke action %q: %w", actionName, err)
 	}
 
-	runID, err := s.newRunID()
+	mode, err := normalizeInvokeMode(params.Mode)
 	if err != nil {
-		return storage.Run{}, fmt.Errorf("invoke action %q: generate run id: %w", actionName, err)
+		return storage.Run{}, fmt.Errorf("invoke action %q: %w", actionName, err)
 	}
 
-	startedAt := s.now()
+	input := cloneJSON(params.Input)
+	requestMetadata := cloneJSON(params.RequestMetadata)
+
+	switch action.ConcurrencyPolicy {
+	case "allow":
+		return s.invokeAllow(ctx, action, mode, input, requestMetadata, params.RequestID)
+	case "reject":
+		return s.invokeReject(ctx, action, mode, input, requestMetadata, params.RequestID)
+	case "queue":
+		return s.invokeQueue(ctx, action, mode, input, requestMetadata, params.RequestID)
+	default:
+		return storage.Run{}, fmt.Errorf("invoke action %q: unsupported concurrency policy %q", actionName, action.ConcurrencyPolicy)
+	}
+}
+
+func (s *Service) HasAction(name string) bool {
+	_, ok := s.registry.Get(strings.TrimSpace(name))
+	return ok
+}
+
+func (s *Service) invokeAllow(ctx context.Context, action config.Action, mode string, input, requestMetadata json.RawMessage, requestID string) (storage.Run, error) {
+	run, err := s.createRun(ctx, action, storage.RunStatusRunning, requestMetadata, true)
+	if err != nil {
+		return storage.Run{}, err
+	}
+
+	if mode == InvokeModeAsync {
+		s.startAsyncInvocation(action, run, input, requestID, context.Background(), nil, nil)
+		return run, nil
+	}
+
+	return s.execute(context.WithoutCancel(ctx), ctx, run, action, input, requestID)
+}
+
+func (s *Service) invokeReject(ctx context.Context, action config.Action, mode string, input, requestMetadata json.RawMessage, requestID string) (storage.Run, error) {
+	s.mu.Lock()
+	state := s.actionState(action.Name)
+	if state.running > 0 {
+		s.mu.Unlock()
+		return storage.Run{}, fmt.Errorf("invoke action %q: %w", action.Name, ErrActionConflict)
+	}
+
+	run, err := s.createRun(ctx, action, storage.RunStatusRunning, requestMetadata, true)
+	if err == nil {
+		state.running = 1
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return storage.Run{}, err
+	}
+
+	finish := func() {
+		s.finishRejectAction(action.Name)
+	}
+
+	if mode == InvokeModeAsync {
+		s.startAsyncInvocation(action, run, input, requestID, context.Background(), finish, nil)
+		return run, nil
+	}
+
+	finishedRun, err := s.execute(context.WithoutCancel(ctx), ctx, run, action, input, requestID)
+	finish()
+	return finishedRun, err
+}
+
+func (s *Service) invokeQueue(ctx context.Context, action config.Action, mode string, input, requestMetadata json.RawMessage, requestID string) (storage.Run, error) {
+	runCtx := context.Background()
+	var waitCh chan invokeResult
+	if mode == InvokeModeSync {
+		runCtx = ctx
+		waitCh = make(chan invokeResult, 1)
+	}
+
+	s.mu.Lock()
+	state := s.actionState(action.Name)
+	if state.running == 0 && len(state.queue) == 0 {
+		run, err := s.createRun(ctx, action, storage.RunStatusRunning, requestMetadata, true)
+		if err == nil {
+			state.running = 1
+		}
+		s.mu.Unlock()
+		if err != nil {
+			return storage.Run{}, err
+		}
+
+		finish := func() {
+			s.finishQueueAction(action.Name)
+		}
+
+		if mode == InvokeModeAsync {
+			s.startAsyncInvocation(action, run, input, requestID, context.Background(), finish, nil)
+			return run, nil
+		}
+
+		finishedRun, err := s.execute(context.WithoutCancel(ctx), ctx, run, action, input, requestID)
+		finish()
+		return finishedRun, err
+	}
+
+	run, err := s.createRun(ctx, action, storage.RunStatusQueued, requestMetadata, false)
+	if err != nil {
+		s.mu.Unlock()
+		return storage.Run{}, err
+	}
+
+	state.queue = append(state.queue, queuedInvocation{
+		action:    action,
+		run:       run,
+		input:     input,
+		requestID: requestID,
+		runCtx:    runCtx,
+		waitCh:    waitCh,
+	})
+	s.mu.Unlock()
+
+	if mode == InvokeModeAsync {
+		return run, nil
+	}
+
+	select {
+	case result := <-waitCh:
+		return result.run, result.err
+	case <-ctx.Done():
+		if s.removeQueuedInvocation(action.Name, run.ID) {
+			cancelledRun, err := s.finishRun(context.Background(), run, storage.RunStatusCancelled, processResult{
+				finishedAt:   s.now(),
+				errorSummary: fmt.Sprintf("execution cancelled: %v", ctx.Err()),
+			})
+			if err != nil {
+				return storage.Run{}, err
+			}
+			return cancelledRun, ctx.Err()
+		}
+
+		return storage.Run{}, ctx.Err()
+	}
+}
+
+func (s *Service) startAsyncInvocation(action config.Action, run storage.Run, input json.RawMessage, requestID string, runCtx context.Context, onFinish func(), waitCh chan invokeResult) {
+	go func() {
+		finishedRun, err := s.execute(context.Background(), runCtx, run, action, cloneJSON(input), requestID)
+		deliverInvokeResult(waitCh, finishedRun, err)
+		if onFinish != nil {
+			onFinish()
+		}
+	}()
+}
+
+func (s *Service) startQueuedInvocation(item queuedInvocation) {
+	if err := item.runCtx.Err(); err != nil {
+		cancelledRun, cancelErr := s.finishRun(context.Background(), item.run, storage.RunStatusCancelled, processResult{
+			finishedAt:   s.now(),
+			errorSummary: fmt.Sprintf("execution cancelled: %v", err),
+		})
+		deliverInvokeResult(item.waitCh, cancelledRun, errors.Join(err, cancelErr))
+		s.finishQueueAction(item.action.Name)
+		return
+	}
+
+	run, err := s.markRunRunning(context.Background(), item.run.ID)
+	if err != nil {
+		failedRun, finishErr := s.finishRun(context.Background(), item.run, storage.RunStatusFailed, processResult{
+			finishedAt:   s.now(),
+			errorSummary: fmt.Sprintf("start queued run: %v", err),
+		})
+		deliverInvokeResult(item.waitCh, failedRun, errors.Join(err, finishErr))
+		s.finishQueueAction(item.action.Name)
+		return
+	}
+
+	s.startAsyncInvocation(item.action, run, item.input, item.requestID, item.runCtx, func() {
+		s.finishQueueAction(item.action.Name)
+	}, item.waitCh)
+}
+
+func (s *Service) createRun(ctx context.Context, action config.Action, status string, requestMetadata json.RawMessage, started bool) (storage.Run, error) {
+	runID, err := s.newRunID()
+	if err != nil {
+		return storage.Run{}, fmt.Errorf("invoke action %q: generate run id: %w", action.Name, err)
+	}
+
+	createdAt := s.now()
+	var startedAt *time.Time
+	if started {
+		startedAt = &createdAt
+	}
+
 	run, err := s.store.CreateRun(ctx, storage.CreateRunParams{
 		ID:              runID,
 		ActionName:      action.Name,
-		Status:          storage.RunStatusRunning,
-		CreatedAt:       startedAt,
-		StartedAt:       &startedAt,
-		RequestMetadata: cloneJSON(params.RequestMetadata),
+		Status:          status,
+		CreatedAt:       createdAt,
+		StartedAt:       startedAt,
+		RequestMetadata: requestMetadata,
 		ActionSnapshot:  actionSnapshotFromConfig(action),
 	})
 	if err != nil {
-		return storage.Run{}, fmt.Errorf("invoke action %q: create run: %w", actionName, err)
+		return storage.Run{}, fmt.Errorf("invoke action %q: create run: %w", action.Name, err)
 	}
 
-	persistCtx := context.WithoutCancel(ctx)
-	return s.execute(persistCtx, ctx, run, action, cloneJSON(params.Input), params.RequestID)
+	return run, nil
+}
+
+func (s *Service) markRunRunning(ctx context.Context, runID string) (storage.Run, error) {
+	startedAt := s.now()
+	if err := s.store.UpdateRun(ctx, storage.UpdateRunParams{
+		ID:        runID,
+		Status:    storage.RunStatusRunning,
+		StartedAt: &startedAt,
+	}); err != nil {
+		return storage.Run{}, fmt.Errorf("mark run %q running: %w", runID, err)
+	}
+
+	run, err := s.store.GetRun(ctx, runID)
+	if err != nil {
+		return storage.Run{}, fmt.Errorf("get run %q after start: %w", runID, err)
+	}
+
+	return run, nil
+}
+
+func (s *Service) actionState(actionName string) *actionState {
+	state, ok := s.actions[actionName]
+	if ok {
+		return state
+	}
+
+	state = &actionState{}
+	s.actions[actionName] = state
+	return state
+}
+
+func (s *Service) finishRejectAction(actionName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, ok := s.actions[actionName]
+	if !ok {
+		return
+	}
+
+	if state.running > 0 {
+		state.running--
+	}
+	if state.running == 0 && len(state.queue) == 0 {
+		delete(s.actions, actionName)
+	}
+}
+
+func (s *Service) finishQueueAction(actionName string) {
+	var next *queuedInvocation
+
+	s.mu.Lock()
+	state, ok := s.actions[actionName]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+
+	if len(state.queue) == 0 {
+		state.running = 0
+		delete(s.actions, actionName)
+		s.mu.Unlock()
+		return
+	}
+
+	queued := state.queue[0]
+	state.queue = state.queue[1:]
+	state.running = 1
+	next = &queued
+	s.mu.Unlock()
+
+	s.startQueuedInvocation(*next)
+}
+
+func (s *Service) removeQueuedInvocation(actionName, runID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, ok := s.actions[actionName]
+	if !ok {
+		return false
+	}
+
+	for i, queued := range state.queue {
+		if queued.run.ID != runID {
+			continue
+		}
+
+		state.queue = append(state.queue[:i], state.queue[i+1:]...)
+		if state.running == 0 && len(state.queue) == 0 {
+			delete(s.actions, actionName)
+		}
+		return true
+	}
+
+	return false
 }
 
 func (s *Service) execute(persistCtx, runCtx context.Context, run storage.Run, action config.Action, input json.RawMessage, requestID string) (storage.Run, error) {
@@ -119,7 +430,10 @@ func (s *Service) execute(persistCtx, runCtx context.Context, run storage.Run, a
 
 	cmd, err := buildCommand(action)
 	if err != nil {
-		return storage.Run{}, fmt.Errorf("invoke action %q run %q: %w", action.Name, run.ID, err)
+		return s.finishRun(persistCtx, run, storage.RunStatusFailed, processResult{
+			finishedAt:   s.now(),
+			errorSummary: err.Error(),
+		})
 	}
 
 	cmd.Dir = action.Cwd
@@ -437,4 +751,24 @@ func generateRunID() (string, error) {
 	}
 
 	return "run_" + hex.EncodeToString(bytes), nil
+}
+
+func normalizeInvokeMode(mode string) (string, error) {
+	switch strings.TrimSpace(mode) {
+	case "", InvokeModeSync:
+		return InvokeModeSync, nil
+	case InvokeModeAsync:
+		return InvokeModeAsync, nil
+	default:
+		return "", ErrInvalidMode
+	}
+}
+
+func deliverInvokeResult(waitCh chan invokeResult, run storage.Run, err error) {
+	if waitCh == nil {
+		return
+	}
+
+	waitCh <- invokeResult{run: run, err: err}
+	close(waitCh)
 }
