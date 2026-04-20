@@ -55,7 +55,7 @@ func Bootstrap(ctx context.Context, cfg config.Config, build buildinfo.Info) (*A
 		return nil, err
 	}
 
-	executorService := execution.New()
+	executorService := execution.New(store, cfg.ActionRegistry())
 
 	return &App{
 		config:   cfg,
