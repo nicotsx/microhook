@@ -1,0 +1,205 @@
+package config
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+func (c Config) Validate() error {
+	var errs ValidationErrors
+
+	validateServer(&errs, c.Server)
+	validateStorage(&errs, c.Storage)
+	actionNames := validateActions(&errs, c.Actions)
+	validateTokens(&errs, c.Auth.Tokens, actionNames)
+
+	return errs.OrNil()
+}
+
+func validateServer(errs *ValidationErrors, server ServerConfig) {
+	if strings.TrimSpace(server.Listen) == "" {
+		errs.Add("server.listen is required")
+	}
+
+	switch server.LogFormat {
+	case DefaultLogFormat, "text":
+	case "":
+		errs.Add("server.log_format is required")
+	default:
+		errs.Add("server.log_format must be one of: json, text")
+	}
+}
+
+func validateStorage(errs *ValidationErrors, storage StorageConfig) {
+	if strings.TrimSpace(storage.Path) == "" {
+		errs.Add("storage.path is required")
+	}
+
+	if storage.RetentionDays < 0 {
+		errs.Add("storage.retention_days must be greater than or equal to 0")
+	}
+
+	if storage.MaxRuns < 0 {
+		errs.Add("storage.max_runs must be greater than or equal to 0")
+	}
+}
+
+func validateActions(errs *ValidationErrors, actions []Action) map[string]int {
+	actionNames := make(map[string]int, len(actions))
+
+	for i, action := range actions {
+		prefix := fmt.Sprintf("actions[%d]", i)
+
+		if action.Name == "" {
+			errs.Add(prefix + ".name is required")
+		} else if previous, exists := actionNames[action.Name]; exists {
+			errs.Add(fmt.Sprintf("%s.name duplicates actions[%d].name (%q)", prefix, previous, action.Name))
+		} else {
+			actionNames[action.Name] = i
+		}
+
+		validateAction(errs, prefix, action)
+	}
+
+	return actionNames
+}
+
+func validateAction(errs *ValidationErrors, prefix string, action Action) {
+	hasCommand := len(action.Command) > 0
+	hasShellCommand := strings.TrimSpace(action.ShellCommand) != ""
+	if hasCommand == hasShellCommand {
+		errs.Add(prefix + " must define exactly one of command or shell_command")
+	}
+
+	for i, arg := range action.Command {
+		if strings.TrimSpace(arg) == "" {
+			errs.Add(fmt.Sprintf("%s.command[%d] must not be empty", prefix, i))
+		}
+	}
+
+	switch action.ConcurrencyPolicy {
+	case "allow", "queue", "reject":
+	case "":
+		errs.Add(prefix + ".concurrency_policy is required")
+	default:
+		errs.Add(fmt.Sprintf("%s.concurrency_policy must be one of: allow, queue, reject", prefix))
+	}
+
+	if action.MaxOutputBytes < 0 {
+		errs.Add(prefix + ".max_output_bytes must be greater than or equal to 0")
+	}
+
+	if strings.IndexByte(action.Cwd, 0) >= 0 {
+		errs.Add(prefix + ".cwd must not contain NUL bytes")
+	}
+
+	validateEnv(errs, prefix, action.Env)
+}
+
+func validateTokens(errs *ValidationErrors, tokens []Token, actionNames map[string]int) {
+	tokenNames := make(map[string]int, len(tokens))
+
+	for i, token := range tokens {
+		prefix := fmt.Sprintf("auth.tokens[%d]", i)
+
+		if token.Name == "" {
+			errs.Add(prefix + ".name is required")
+		} else if previous, exists := tokenNames[token.Name]; exists {
+			errs.Add(fmt.Sprintf("%s.name duplicates auth.tokens[%d].name (%q)", prefix, previous, token.Name))
+		} else {
+			tokenNames[token.Name] = i
+		}
+
+		if token.Value == "" {
+			errs.Add(prefix + ".value is required")
+		}
+
+		seenActions := make(map[string]int, len(token.Actions))
+		for actionIndex, actionName := range token.Actions {
+			if actionName == "" {
+				errs.Add(fmt.Sprintf("%s.actions[%d] must not be empty", prefix, actionIndex))
+				continue
+			}
+
+			if previous, exists := seenActions[actionName]; exists {
+				errs.Add(fmt.Sprintf("%s.actions[%d] duplicates %s.actions[%d] (%q)", prefix, actionIndex, prefix, previous, actionName))
+				continue
+			}
+
+			seenActions[actionName] = actionIndex
+			if _, exists := actionNames[actionName]; !exists {
+				errs.Add(fmt.Sprintf("%s.actions[%d] references unknown action %q", prefix, actionIndex, actionName))
+			}
+		}
+	}
+}
+
+func validateEnv(errs *ValidationErrors, prefix string, env map[string]string) {
+	if len(env) == 0 {
+		return
+	}
+
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		switch {
+		case strings.TrimSpace(key) == "":
+			errs.Add(prefix + ".env contains an empty key")
+		case strings.Contains(key, "="):
+			errs.Add(fmt.Sprintf("%s.env key %q must not contain '='", prefix, key))
+		case strings.IndexByte(key, 0) >= 0:
+			errs.Add(fmt.Sprintf("%s.env key %q must not contain NUL bytes", prefix, key))
+		case strings.IndexByte(env[key], 0) >= 0:
+			errs.Add(fmt.Sprintf("%s.env[%q] must not contain NUL bytes", prefix, key))
+		}
+	}
+}
+
+type ValidationErrors struct {
+	messages []string
+}
+
+func (v *ValidationErrors) Add(message string) {
+	v.messages = append(v.messages, message)
+}
+
+func (v *ValidationErrors) Append(err error) {
+	if err == nil {
+		return
+	}
+
+	switch typed := err.(type) {
+	case ValidationErrors:
+		v.messages = append(v.messages, typed.messages...)
+	case *ValidationErrors:
+		v.messages = append(v.messages, typed.messages...)
+	default:
+		v.Add(err.Error())
+	}
+}
+
+func (v ValidationErrors) OrNil() error {
+	if len(v.messages) == 0 {
+		return nil
+	}
+
+	return v
+}
+
+func (v ValidationErrors) Error() string {
+	var builder strings.Builder
+	for i, message := range v.messages {
+		if i > 0 {
+			builder.WriteByte('\n')
+		}
+		builder.WriteString("- ")
+		builder.WriteString(message)
+	}
+
+	return builder.String()
+}

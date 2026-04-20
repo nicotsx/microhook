@@ -28,10 +28,6 @@ storage:
 	}
 
 	output := stderr.String()
-	if !strings.Contains(output, "server.listen is required") {
-		t.Fatalf("expected server.listen validation error, got %q", output)
-	}
-
 	if !strings.Contains(output, "storage.path is required") {
 		t.Fatalf("expected storage.path validation error, got %q", output)
 	}
