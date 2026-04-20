@@ -1,0 +1,22 @@
+[Unit]
+Description=Microhook local action runner
+Documentation=https://github.com/nicotsx/microhook
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/microhook/config.yml
+
+[Service]
+Type=simple
+User=microhook
+Group=microhook
+Environment=MICROHOOK_CONFIG=/etc/microhook/config.yml
+ExecStart=/usr/local/bin/microhook serve
+WorkingDirectory=/var/lib/microhook
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

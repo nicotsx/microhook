@@ -1,0 +1,24 @@
+server:
+  listen: "127.0.0.1:9464"
+  log_format: "json"
+
+auth:
+  tokens:
+    - name: "example-client"
+      value: "mhv1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      actions: ["hello"]
+
+storage:
+  path: "/var/lib/microhook/microhook.db"
+  retention_days: 30
+  max_runs: 10000
+
+actions:
+  - name: "hello"
+    description: "Simple smoke-test action"
+    command: ["/bin/sh", "-c", "cat >/dev/null; printf hello"]
+    cwd: "/var/lib/microhook"
+    timeout: "30s"
+    concurrency_policy: "allow"
+    max_output_bytes: 65536
+    enabled: true
