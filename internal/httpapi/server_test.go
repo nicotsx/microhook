@@ -276,6 +276,45 @@ func TestInvokeActionAsyncReturnsAcceptedRunAndSupportsLookup(t *testing.T) {
 	}
 }
 
+func TestInvokeActionAsyncQueueReturnsQueuedRunIDBeforeWorkStarts(t *testing.T) {
+	fixture := newServerFixture(t, []config.Action{
+		testAction("deploy", `sleep 0.15; printf done`, "queue"),
+	})
+
+	first := fixture.doRequest(http.MethodPost, "/v1/actions/deploy/runs", `{"mode":"async","input":{"request_id":"first"}}`, fixture.globalToken, "")
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("expected status %d, got %d", http.StatusAccepted, first.Code)
+	}
+	var running runResponse
+	decodeResponseJSON(t, first, &running)
+	if running.Status != storage.RunStatusRunning {
+		t.Fatalf("expected first async status %q, got %q", storage.RunStatusRunning, running.Status)
+	}
+
+	second := fixture.doRequest(http.MethodPost, "/v1/actions/deploy/runs", `{"mode":"async","input":{"request_id":"second"}}`, fixture.globalToken, "")
+	if second.Code != http.StatusAccepted {
+		t.Fatalf("expected status %d, got %d", http.StatusAccepted, second.Code)
+	}
+
+	var queued runResponse
+	decodeResponseJSON(t, second, &queued)
+	if queued.ID == "" {
+		t.Fatal("expected queued async response to include a run id")
+	}
+	if queued.Status != storage.RunStatusQueued {
+		t.Fatalf("expected queued async status %q, got %q", storage.RunStatusQueued, queued.Status)
+	}
+	if queued.StartedAt != nil {
+		t.Fatalf("expected queued async response to omit started_at, got %v", queued.StartedAt)
+	}
+
+	fixture.waitForRun(t, running.ID)
+	completed := fixture.waitForRun(t, queued.ID)
+	if completed.Status != storage.RunStatusSucceeded {
+		t.Fatalf("expected queued async run status %q, got %q", storage.RunStatusSucceeded, completed.Status)
+	}
+}
+
 func TestInvokeActionBadRequestConflictAndNotFound(t *testing.T) {
 	fixture := newServerFixture(t, []config.Action{
 		testAction("reject-run", `sleep 0.15; printf done`, "reject"),

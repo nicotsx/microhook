@@ -196,6 +196,131 @@ func TestBootstrapAppliesConfiguredRetentionOnStartup(t *testing.T) {
 	}
 }
 
+func TestBootstrapRecoversPersistedQueueStateOnStartup(t *testing.T) {
+	ctx := context.Background()
+	storagePath := filepath.Join(t.TempDir(), "microhook.db")
+	store, err := storage.Open(ctx, storagePath)
+	if err != nil {
+		t.Fatalf("open seed storage: %v", err)
+	}
+
+	startedAt := time.Date(2026, time.April, 21, 10, 15, 0, 0, time.UTC)
+	if _, err := store.CreateRun(ctx, storage.CreateRunParams{
+		ID:              "run-interrupted",
+		ActionName:      "serial",
+		Status:          storage.RunStatusRunning,
+		CreatedAt:       startedAt.Add(-2 * time.Second),
+		StartedAt:       &startedAt,
+		RequestMetadata: json.RawMessage(`{"mode":"async","request_id":"interrupted"}`),
+		ActionSnapshot: storage.ActionSnapshot{
+			Description:       "Interrupted run",
+			Mode:              config.ActionModeCommand,
+			Command:           []string{"/bin/sh", "-c", "printf should-not-run"},
+			Timeout:           time.Second,
+			ConcurrencyPolicy: "queue",
+			MaxOutputBytes:    64,
+			Enabled:           true,
+		},
+	}); err != nil {
+		t.Fatalf("create interrupted run: %v", err)
+	}
+
+	queuedAt := startedAt.Add(time.Second)
+	if _, err := store.CreateRun(ctx, storage.CreateRunParams{
+		ID:              "run-queued",
+		ActionName:      "serial",
+		Status:          storage.RunStatusQueued,
+		CreatedAt:       queuedAt,
+		RequestMetadata: json.RawMessage(`{"mode":"async","request_id":"boot-recovered"}`),
+		ActionSnapshot: storage.ActionSnapshot{
+			Description:       "Recovered queued run",
+			Mode:              config.ActionModeCommand,
+			Command:           []string{"/bin/sh", "-c", `printf "$MICROHOOK_REQUEST_ID"`},
+			Timeout:           time.Second,
+			ConcurrencyPolicy: "queue",
+			MaxOutputBytes:    64,
+			Enabled:           true,
+		},
+	}); err != nil {
+		t.Fatalf("create queued run: %v", err)
+	}
+	if _, err := store.EnqueueRun(ctx, storage.EnqueueRunParams{
+		RunID:      "run-queued",
+		ActionName: "serial",
+		EnqueuedAt: queuedAt,
+		Input:      json.RawMessage(`{"request_id":"boot-recovered"}`),
+	}); err != nil {
+		t.Fatalf("enqueue queued run: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close seed storage: %v", err)
+	}
+
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:    "127.0.0.1:0",
+			LogFormat: "json",
+		},
+		Storage: config.StorageConfig{
+			Path: storagePath,
+		},
+		Actions: []config.Action{{
+			Name:              "serial",
+			Mode:              config.ActionModeCommand,
+			Command:           []string{"/bin/sh", "-c", "printf registry-definition"},
+			Timeout:           time.Second,
+			ConcurrencyPolicy: "queue",
+			MaxOutputBytes:    64,
+			Enabled:           true,
+		}},
+	}
+
+	application, err := Bootstrap(ctx, cfg, buildinfo.Current())
+	if err != nil {
+		t.Fatalf("bootstrap app: %v", err)
+	}
+	defer func() {
+		if err := application.Close(); err != nil {
+			t.Errorf("close app: %v", err)
+		}
+	}()
+
+	assertEventually(t, 3*time.Second, func() error {
+		run, err := application.storage.GetRun(ctx, "run-interrupted")
+		if err != nil {
+			return err
+		}
+		if run.Status != storage.RunStatusCancelled {
+			return errors.New("interrupted run not cancelled yet")
+		}
+		if run.ErrorSummary != "service restarted before run completion" {
+			return errors.New("interrupted run summary not recovered yet")
+		}
+
+		queuedRun, err := application.storage.GetRun(ctx, "run-queued")
+		if err != nil {
+			return err
+		}
+		if queuedRun.Status != storage.RunStatusSucceeded {
+			return errors.New("queued run not finished yet")
+		}
+		if queuedRun.StdoutTail != "boot-recovered" {
+			return errors.New("queued run did not execute recovered snapshot")
+		}
+
+		queuedRuns, err := application.storage.ListQueuedRuns(ctx, "serial")
+		if err != nil {
+			return err
+		}
+		if len(queuedRuns) != 0 {
+			return errors.New("queued metadata still present after recovery")
+		}
+
+		return nil
+	})
+}
+
 func assertEventually(t *testing.T, timeout time.Duration, check func() error) {
 	t.Helper()
 

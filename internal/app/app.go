@@ -56,6 +56,12 @@ func Bootstrap(ctx context.Context, cfg config.Config, build buildinfo.Info) (*A
 	}
 
 	executorService := execution.New(store, cfg.ActionRegistry())
+	if err := executorService.Recover(ctx); err != nil {
+		if closeErr := store.Close(); closeErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("close storage after execution recovery failure: %w", closeErr))
+		}
+		return nil, err
+	}
 
 	return &App{
 		config:   cfg,
