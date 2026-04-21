@@ -1,3 +1,4 @@
+// Package config defines the configuration structures and constants for the microhook application.
 package config
 
 import "time"

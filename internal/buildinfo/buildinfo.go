@@ -1,3 +1,4 @@
+// Package buildinfo provides build information about the application
 package buildinfo
 
 import "runtime"

@@ -1,3 +1,4 @@
+// Package storage provides the Store struct
 package storage
 
 import (

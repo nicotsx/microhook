@@ -1,3 +1,4 @@
+// Package auth provides authentication and authorization services for Microhook.
 package auth
 
 import (
@@ -88,10 +89,6 @@ func New(cfg config.AuthConfig) (*Service, error) {
 }
 
 func (s *Service) AuthenticateRequest(request *http.Request) (Identity, error) {
-	if request == nil {
-		return Identity{}, ErrMissingBearerToken
-	}
-
 	return s.AuthenticateHeader(request.Header.Get("Authorization"))
 }
 

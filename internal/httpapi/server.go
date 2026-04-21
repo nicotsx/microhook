@@ -1,3 +1,4 @@
+// Package httpapi implements an HTTP API server for managing and invoking actions.
 package httpapi
 
 import (
@@ -430,10 +431,6 @@ func extractRequestID(request *http.Request, input json.RawMessage) string {
 }
 
 func headerRequestID(request *http.Request) string {
-	if request == nil {
-		return ""
-	}
-
 	return strings.TrimSpace(request.Header.Get("X-Request-Id"))
 }
 
