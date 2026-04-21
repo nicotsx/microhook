@@ -4,7 +4,6 @@ package cli
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -19,9 +18,17 @@ import (
 	"github.com/nicotsx/microhook/internal/auth/tokenformat"
 	"github.com/nicotsx/microhook/internal/buildinfo"
 	"github.com/nicotsx/microhook/internal/config"
+	urfavecli "github.com/urfave/cli/v3"
 )
 
-const shutdownTimeout = 10 * time.Second
+const (
+	shutdownTimeout  = 10 * time.Second
+	rootHelpTemplate = `Usage: {{.Name}} <command> [flags]
+
+Commands:{{range .VisibleCommands}}
+  {{printf "%-17s" .Name}} {{.Usage}}{{end}}
+`
+)
 
 type Runner struct {
 	stdout io.Writer
@@ -40,68 +47,108 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 }
 
 func (r Runner) Run(ctx context.Context, args []string) int {
-	if len(args) == 0 {
-		if err := r.printUsage(); err != nil {
-			return 1
+	root := r.command()
+	err := root.Run(ctx, append([]string{root.Name}, args...))
+	return commandExitCode(err)
+}
+
+func (r Runner) command() *urfavecli.Command {
+	onUsageError := func(ctx context.Context, cmd *urfavecli.Command, err error, _ bool) error {
+		if writeErr := r.writef(r.stderr, "Incorrect Usage: %s\n\n", err); writeErr != nil {
+			return writeErr
 		}
-		return 2
+
+		if helpErr := showCommandHelp(ctx, cmd); helpErr != nil {
+			return helpErr
+		}
+
+		return exit(2)
 	}
 
-	switch args[0] {
-	case "serve":
-		return r.runServe(ctx, args[1:])
-	case "validate-config":
-		return r.runValidateConfig(args[1:])
-	case "generate-token":
-		return r.runGenerateToken(args[1:])
-	case "version":
-		return r.runVersion(args[1:])
-	case "help", "-h", "--help":
-		if err := r.printUsage(); err != nil {
-			return 1
-		}
-		return 0
-	default:
-		if err := r.writef(r.stderr, "unknown command %q\n\n", args[0]); err != nil {
-			return 1
-		}
-		if err := r.printUsage(); err != nil {
-			return 1
-		}
-		return 2
+	return &urfavecli.Command{
+		Name:                          "microhook",
+		Writer:                        r.stderr,
+		ErrWriter:                     r.stderr,
+		HideHelpCommand:               true,
+		HideVersion:                   true,
+		CustomRootCommandHelpTemplate: rootHelpTemplate,
+		ExitErrHandler:                func(context.Context, *urfavecli.Command, error) {},
+		OnUsageError:                  onUsageError,
+		Action:                        r.runRoot,
+		Commands: []*urfavecli.Command{
+			{
+				Name:         "serve",
+				Usage:        "Start the Microhook service",
+				OnUsageError: onUsageError,
+				Flags: []urfavecli.Flag{
+					&urfavecli.StringFlag{Name: "config", Usage: "Path to the config file"},
+				},
+				Action: r.runServe,
+			},
+			{
+				Name:         "generate-token",
+				Usage:        "Print a new bearer token",
+				OnUsageError: onUsageError,
+				Action:       r.runGenerateToken,
+			},
+			{
+				Name:         "validate-config",
+				Usage:        "Validate the Microhook config file",
+				OnUsageError: onUsageError,
+				Flags: []urfavecli.Flag{
+					&urfavecli.StringFlag{Name: "config", Usage: "Path to the config file"},
+				},
+				Action: r.runValidateConfig,
+			},
+			{
+				Name:         "version",
+				Usage:        "Print build metadata",
+				OnUsageError: onUsageError,
+				Action:       r.runVersion,
+			},
+		},
 	}
 }
 
-func (r Runner) runServe(ctx context.Context, args []string) int {
-	flagSet := newFlagSet("serve", r.stderr)
-	configPath := flagSet.String("config", "", "Path to the config file")
-
-	if err := flagSet.Parse(args); err != nil {
-		return flagExitCode(err)
-	}
-
-	if flagSet.NArg() != 0 {
-		if err := r.writef(r.stderr, "serve does not accept positional arguments: %s\n", strings.Join(flagSet.Args(), " ")); err != nil {
-			return 1
+func (r Runner) runRoot(_ context.Context, cmd *urfavecli.Command) error {
+	if cmd.NArg() == 0 {
+		if err := urfavecli.ShowRootCommandHelp(cmd); err != nil {
+			return err
 		}
-		return 2
+		return exit(2)
 	}
 
-	resolvedConfigPath := config.ResolvePath(*configPath)
+	if err := r.writef(r.stderr, "unknown command %q\n\n", cmd.Args().First()); err != nil {
+		return err
+	}
+
+	if err := urfavecli.ShowRootCommandHelp(cmd); err != nil {
+		return err
+	}
+
+	return exit(2)
+}
+
+func (r Runner) runServe(ctx context.Context, cmd *urfavecli.Command) error {
+	if err := r.rejectPositionalArgs("serve", cmd); err != nil {
+		return err
+	}
+
+	resolvedConfigPath := config.ResolvePath(cmd.String("config"))
 	cfg, err := config.Load(resolvedConfigPath)
 	if err != nil {
 		if writeErr := r.writeln(r.stderr, err); writeErr != nil {
-			return 1
+			return writeErr
 		}
-		return 1
+		return exit(1)
 	}
 
 	application, err := app.Bootstrap(ctx, cfg, r.build())
 	if err != nil {
 		if writeErr := r.writef(r.stderr, "bootstrap service: %v\n", err); writeErr != nil {
-			return 1
+			return writeErr
 		}
-		return 1
+		return exit(1)
 	}
 
 	listener, err := net.Listen("tcp", cfg.Server.Listen)
@@ -110,9 +157,9 @@ func (r Runner) runServe(ctx context.Context, args []string) int {
 			err = errors.Join(err, fmt.Errorf("close service after listen failure: %w", closeErr))
 		}
 		if writeErr := r.writef(r.stderr, "listen on %q: %v\n", cfg.Server.Listen, err); writeErr != nil {
-			return 1
+			return writeErr
 		}
-		return 1
+		return exit(1)
 	}
 
 	serveErrs := make(chan error, 1)
@@ -130,19 +177,19 @@ func (r Runner) runServe(ctx context.Context, args []string) int {
 				err = errors.Join(err, fmt.Errorf("close service after serve failure: %w", closeErr))
 			}
 			if writeErr := r.writef(r.stderr, "serve: %v\n", err); writeErr != nil {
-				return 1
+				return writeErr
 			}
-			return 1
+			return exit(1)
 		}
 
 		if err := application.Close(); err != nil {
 			if writeErr := r.writef(r.stderr, "close service: %v\n", err); writeErr != nil {
-				return 1
+				return writeErr
 			}
-			return 1
+			return exit(1)
 		}
 
-		return 0
+		return nil
 	case <-serveCtx.Done():
 	}
 
@@ -154,111 +201,68 @@ func (r Runner) runServe(ctx context.Context, args []string) int {
 
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 		if writeErr := r.writef(r.stderr, "serve: %v\n", serveErr); writeErr != nil {
-			return 1
+			return writeErr
 		}
-		return 1
+		return exit(1)
 	}
 
 	if shutdownErr != nil {
 		if writeErr := r.writef(r.stderr, "shutdown service: %v\n", shutdownErr); writeErr != nil {
-			return 1
+			return writeErr
 		}
-		return 1
+		return exit(1)
 	}
 
-	return 0
+	return nil
 }
 
-func (r Runner) runValidateConfig(args []string) int {
-	flagSet := newFlagSet("validate-config", r.stderr)
-	configPath := flagSet.String("config", "", "Path to the config file")
-
-	if err := flagSet.Parse(args); err != nil {
-		return flagExitCode(err)
+func (r Runner) runValidateConfig(_ context.Context, cmd *urfavecli.Command) error {
+	if err := r.rejectPositionalArgs("validate-config", cmd); err != nil {
+		return err
 	}
 
-	if flagSet.NArg() != 0 {
-		if err := r.writef(r.stderr, "validate-config does not accept positional arguments: %s\n", strings.Join(flagSet.Args(), " ")); err != nil {
-			return 1
-		}
-		return 2
-	}
-
-	resolvedConfigPath := config.ResolvePath(*configPath)
+	resolvedConfigPath := config.ResolvePath(cmd.String("config"))
 	if _, err := config.Load(resolvedConfigPath); err != nil {
 		if writeErr := r.writeln(r.stderr, err); writeErr != nil {
-			return 1
+			return writeErr
 		}
-		return 1
+		return exit(1)
 	}
 
 	if err := r.writef(r.stdout, "config is valid: %s\n", resolvedConfigPath); err != nil {
-		return 1
+		return err
 	}
-	return 0
+
+	return nil
 }
 
-func (r Runner) runGenerateToken(args []string) int {
-	flagSet := newFlagSet("generate-token", r.stderr)
-	if err := flagSet.Parse(args); err != nil {
-		return flagExitCode(err)
-	}
-
-	if flagSet.NArg() != 0 {
-		if err := r.writef(r.stderr, "generate-token does not accept positional arguments: %s\n", strings.Join(flagSet.Args(), " ")); err != nil {
-			return 1
-		}
-		return 2
+func (r Runner) runGenerateToken(_ context.Context, cmd *urfavecli.Command) error {
+	if err := r.rejectPositionalArgs("generate-token", cmd); err != nil {
+		return err
 	}
 
 	token, err := tokenformat.Generate()
 	if err != nil {
 		if writeErr := r.writef(r.stderr, "generate token: %v\n", err); writeErr != nil {
-			return 1
+			return writeErr
 		}
-		return 1
+		return exit(1)
 	}
 
 	if err := r.writeln(r.stdout, token); err != nil {
-		return 1
+		return err
 	}
 
-	return 0
+	return nil
 }
 
-func (r Runner) runVersion(args []string) int {
-	flagSet := newFlagSet("version", r.stderr)
-	if err := flagSet.Parse(args); err != nil {
-		return flagExitCode(err)
-	}
-
-	if flagSet.NArg() != 0 {
-		if err := r.writef(r.stderr, "version does not accept positional arguments: %s\n", strings.Join(flagSet.Args(), " ")); err != nil {
-			return 1
-		}
-		return 2
+func (r Runner) runVersion(_ context.Context, cmd *urfavecli.Command) error {
+	if err := r.rejectPositionalArgs("version", cmd); err != nil {
+		return err
 	}
 
 	for _, line := range r.build().Lines() {
 		if err := r.writeln(r.stdout, line); err != nil {
-			return 1
-		}
-	}
-
-	return 0
-}
-
-func (r Runner) printUsage() error {
-	for _, line := range []string{
-		"Usage: microhook <command> [flags]",
-		"",
-		"Commands:",
-		"  serve             Start the Microhook service",
-		"  generate-token    Print a new bearer token",
-		"  validate-config   Validate the Microhook config file",
-		"  version           Print build metadata",
-	} {
-		if err := r.writeln(r.stderr, line); err != nil {
 			return err
 		}
 	}
@@ -266,18 +270,41 @@ func (r Runner) printUsage() error {
 	return nil
 }
 
-func newFlagSet(name string, output io.Writer) *flag.FlagSet {
-	flagSet := flag.NewFlagSet(name, flag.ContinueOnError)
-	flagSet.SetOutput(output)
-	return flagSet
+func (r Runner) rejectPositionalArgs(command string, cmd *urfavecli.Command) error {
+	if cmd.NArg() == 0 {
+		return nil
+	}
+
+	if err := r.writef(r.stderr, "%s does not accept positional arguments: %s\n", command, strings.Join(cmd.Args().Slice(), " ")); err != nil {
+		return err
+	}
+
+	return exit(2)
 }
 
-func flagExitCode(err error) int {
-	if errors.Is(err, flag.ErrHelp) {
+func showCommandHelp(ctx context.Context, cmd *urfavecli.Command) error {
+	if cmd == cmd.Root() {
+		return urfavecli.ShowRootCommandHelp(cmd)
+	}
+
+	return urfavecli.ShowCommandHelp(ctx, cmd.Root(), cmd.Name)
+}
+
+func commandExitCode(err error) int {
+	if err == nil {
 		return 0
 	}
 
-	return 2
+	var exitErr urfavecli.ExitCoder
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+
+	return 1
+}
+
+func exit(code int) error {
+	return urfavecli.Exit("", code)
 }
 
 func (r Runner) writef(writer io.Writer, format string, args ...any) error {

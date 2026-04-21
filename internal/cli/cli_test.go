@@ -37,6 +37,44 @@ storage:
 	}
 }
 
+func TestExecuteWithoutCommandPrintsUsage(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := Execute(context.Background(), nil, &stdout, &stderr)
+	if exitCode != 2 {
+		t.Fatalf("expected exit code 2, got %d with stderr %q", exitCode, stderr.String())
+	}
+
+	if !strings.Contains(stderr.String(), "Usage: microhook <command> [flags]") {
+		t.Fatalf("expected usage output, got %q", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("expected no stdout output, got %q", stdout.String())
+	}
+}
+
+func TestUnknownCommandPrintsUsage(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := Execute(context.Background(), []string{"wat"}, &stdout, &stderr)
+	if exitCode != 2 {
+		t.Fatalf("expected exit code 2, got %d with stderr %q", exitCode, stderr.String())
+	}
+
+	output := stderr.String()
+	if !strings.Contains(output, `unknown command "wat"`) {
+		t.Fatalf("expected unknown command error, got %q", output)
+	}
+	if !strings.Contains(output, "Usage: microhook <command> [flags]") {
+		t.Fatalf("expected usage output, got %q", output)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("expected no stdout output, got %q", stdout.String())
+	}
+}
+
 func TestGenerateTokenPrintsValidToken(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
