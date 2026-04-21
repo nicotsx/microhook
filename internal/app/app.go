@@ -29,7 +29,7 @@ type App struct {
 	http     *httpapi.Server
 }
 
-func Bootstrap(ctx context.Context, cfg config.Config, build buildinfo.Info) (*App, error) {
+func Bootstrap(ctx context.Context, cfg config.Config, build buildinfo.Info) (app *App, err error) {
 	logger := newLogger(cfg.Server.LogFormat, os.Stderr)
 
 	store, err := storage.Open(ctx, cfg.Storage.Path)
@@ -37,29 +37,34 @@ func Bootstrap(ctx context.Context, cfg config.Config, build buildinfo.Info) (*A
 		return nil, err
 	}
 
-	if _, err := store.ApplyRetention(ctx, storage.RetentionPolicy{
+	closeContext := ""
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		if closeErr := store.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close storage after %s failure: %w", closeContext, closeErr))
+		}
+	}()
+
+	closeContext = "retention"
+	if _, err = store.ApplyRetention(ctx, storage.RetentionPolicy{
 		MaxAge:  time.Duration(cfg.Storage.RetentionDays) * 24 * time.Hour,
 		MaxRuns: cfg.Storage.MaxRuns,
 	}); err != nil {
-		if closeErr := store.Close(); closeErr != nil {
-			return nil, errors.Join(err, fmt.Errorf("close storage after retention failure: %w", closeErr))
-		}
 		return nil, err
 	}
 
+	closeContext = "auth bootstrap"
 	authService, err := auth.New(cfg.Auth)
 	if err != nil {
-		if closeErr := store.Close(); closeErr != nil {
-			return nil, errors.Join(err, fmt.Errorf("close storage after auth bootstrap failure: %w", closeErr))
-		}
 		return nil, err
 	}
 
 	executorService := execution.New(store, cfg.ActionRegistry())
-	if err := executorService.Recover(ctx); err != nil {
-		if closeErr := store.Close(); closeErr != nil {
-			return nil, errors.Join(err, fmt.Errorf("close storage after execution recovery failure: %w", closeErr))
-		}
+	closeContext = "execution recovery"
+	if err = executorService.Recover(ctx); err != nil {
 		return nil, err
 	}
 
