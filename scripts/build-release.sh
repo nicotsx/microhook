@@ -21,7 +21,7 @@ checksum_file() {
   shasum -a 256 "$1"
 }
 
-ldflags="-X ${BUILDINFO_PACKAGE}.Version=${VERSION} -X ${BUILDINFO_PACKAGE}.Commit=${COMMIT} -X ${BUILDINFO_PACKAGE}.BuildTime=${BUILD_TIME} -X ${BUILDINFO_PACKAGE}.BuiltBy=${BUILT_BY}"
+ldflags="-s -w -X ${BUILDINFO_PACKAGE}.Version=${VERSION} -X ${BUILDINFO_PACKAGE}.Commit=${COMMIT} -X ${BUILDINFO_PACKAGE}.BuildTime=${BUILD_TIME} -X ${BUILDINFO_PACKAGE}.BuiltBy=${BUILT_BY}"
 
 mkdir -p "${RELEASE_DIR}"
 rm -f "${RELEASE_DIR}/checksums.txt"

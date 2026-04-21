@@ -16,7 +16,7 @@ ARG TARGETARCH
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-$(go env GOARCH)} go build \
   -trimpath \
-  -ldflags "-X github.com/nicotsx/microhook/internal/buildinfo.Version=${VERSION} -X github.com/nicotsx/microhook/internal/buildinfo.Commit=${COMMIT} -X github.com/nicotsx/microhook/internal/buildinfo.BuildTime=${BUILD_TIME} -X github.com/nicotsx/microhook/internal/buildinfo.BuiltBy=${BUILT_BY}" \
+  -ldflags "-s -w -X github.com/nicotsx/microhook/internal/buildinfo.Version=${VERSION} -X github.com/nicotsx/microhook/internal/buildinfo.Commit=${COMMIT} -X github.com/nicotsx/microhook/internal/buildinfo.BuildTime=${BUILD_TIME} -X github.com/nicotsx/microhook/internal/buildinfo.BuiltBy=${BUILT_BY}" \
   -o /out/microhook ./cmd/microhook
 
 FROM alpine:3.22

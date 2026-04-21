@@ -16,7 +16,8 @@ COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 BUILT_BY ?= $(shell whoami)
 
-LDFLAGS := -X $(BUILDINFO_PACKAGE).Version=$(VERSION)
+LDFLAGS := -s -w
+LDFLAGS += -X $(BUILDINFO_PACKAGE).Version=$(VERSION)
 LDFLAGS += -X $(BUILDINFO_PACKAGE).Commit=$(COMMIT)
 LDFLAGS += -X $(BUILDINFO_PACKAGE).BuildTime=$(BUILD_TIME)
 LDFLAGS += -X $(BUILDINFO_PACKAGE).BuiltBy=$(BUILT_BY)
