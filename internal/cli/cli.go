@@ -66,15 +66,17 @@ func (r Runner) command() *urfavecli.Command {
 	}
 
 	return &urfavecli.Command{
-		Name:                          "microhook",
-		Writer:                        r.stderr,
-		ErrWriter:                     r.stderr,
-		HideHelpCommand:               true,
-		HideVersion:                   true,
-		CustomRootCommandHelpTemplate: rootHelpTemplate,
-		ExitErrHandler:                func(context.Context, *urfavecli.Command, error) {},
-		OnUsageError:                  onUsageError,
-		Action:                        r.runRoot,
+		Name:                            "microhook",
+		EnableShellCompletion:           true,
+		Writer:                          r.stderr,
+		ErrWriter:                       r.stderr,
+		HideHelpCommand:                 true,
+		HideVersion:                     true,
+		CustomRootCommandHelpTemplate:   rootHelpTemplate,
+		ConfigureShellCompletionCommand: r.configureCompletionCommand,
+		ExitErrHandler:                  func(context.Context, *urfavecli.Command, error) {},
+		OnUsageError:                    onUsageError,
+		Action:                          r.runRoot,
 		Commands: []*urfavecli.Command{
 			{
 				Name:         "serve",
@@ -107,6 +109,28 @@ func (r Runner) command() *urfavecli.Command {
 				Action:       r.runVersion,
 			},
 		},
+	}
+}
+
+func (r Runner) configureCompletionCommand(cmd *urfavecli.Command) {
+	originalAction := cmd.Action
+
+	cmd.Hidden = false
+	cmd.Writer = r.stdout
+	cmd.ErrWriter = r.stderr
+	cmd.Action = func(ctx context.Context, cmd *urfavecli.Command) error {
+		err := originalAction(ctx, cmd)
+		if err == nil {
+			return nil
+		}
+
+		if err.Error() != "" {
+			if writeErr := r.writeln(r.stderr, err); writeErr != nil {
+				return writeErr
+			}
+		}
+
+		return err
 	}
 }
 

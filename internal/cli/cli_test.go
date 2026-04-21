@@ -75,6 +75,43 @@ func TestUnknownCommandPrintsUsage(t *testing.T) {
 	}
 }
 
+func TestCompletionCommandPrintsScriptToStdout(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := Execute(context.Background(), []string{"completion", "bash"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("expected zero exit code, got %d with stderr %q", exitCode, stderr.String())
+	}
+
+	if !strings.Contains(stdout.String(), "#!/bin/bash") {
+		t.Fatalf("expected bash completion script, got %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "microhook") {
+		t.Fatalf("expected script to reference command name, got %q", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr output, got %q", stderr.String())
+	}
+}
+
+func TestCompletionCommandRequiresShell(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := Execute(context.Background(), []string{"completion"}, &stdout, &stderr)
+	if exitCode == 0 {
+		t.Fatalf("expected non-zero exit code, got %d", exitCode)
+	}
+
+	if !strings.Contains(stderr.String(), "no shell provided for completion command") {
+		t.Fatalf("expected missing shell error, got %q", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("expected no stdout output, got %q", stdout.String())
+	}
+}
+
 func TestGenerateTokenPrintsValidToken(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
